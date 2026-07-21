@@ -1,0 +1,26 @@
+[package]
+name = "host-supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "宿主侧可信控制面（§13.3 控制面）：审计 sink + 人审门 + 仲裁器 + VM 快照控制。"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+vsock.workspace = true
+
+[lib]
+name = "host_supervisor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "host-supervisor"
+path = "src/bin/host_supervisor.rs"

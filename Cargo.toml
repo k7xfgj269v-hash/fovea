@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/introspect-schema",
+    "crates/vsock",
+    "crates/guest-agent",
+    "crates/host-supervisor",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["AI-Native OS contributors"]
+repository = "https://github.com/ai-native-os/ai-native-os"
+description = "把一台 Unix 机器改造成 AI 的「玻璃盒」——人照常用 shell，额外给 AI 一层能全内省、可操作内核的系统接口面。"
+
+[workspace.dependencies]
+# 序列化：内部强类型，出口 JSON
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 错误链
+thiserror = "1"
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# 异步运行时（控制面用，数据面 introspect 本身保持同步可单测）
+tokio = { version = "1", features = ["full"] }
+# 异步 trait
+async-trait = "0.1"
+# 时间
+chrono = { version = "0.4", features = ["serde"] }
+# 唯一 id
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# workspace 内部依赖走 path
+vsock = { path = "crates/vsock" }
+introspect-schema = { path = "crates/introspect-schema" }
+
+[profile.release]
+debug = true  # 控制面出问题时要能看栈，先别剥调试信息

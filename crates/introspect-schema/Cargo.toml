@@ -1,0 +1,15 @@
+[package]
+name = "introspect-schema"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "introspect(pid) Level 0/1 返回结构（§10）。跨 vsock 信任边界的合同，独立成包。"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+[lib]
+name = "introspect_schema"
+path = "src/lib.rs"
