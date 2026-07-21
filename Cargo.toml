@@ -11,8 +11,8 @@ members = [
 version = "0.0.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-authors = ["AI-Native OS contributors"]
-repository = "https://github.com/ai-native-os/ai-native-os"
+authors = ["Fovea contributors"]
+repository = "https://github.com/k7xfgj269v-hash/fovea"
 description = "把一台 Unix 机器改造成 AI 的「玻璃盒」——人照常用 shell，额外给 AI 一层能全内省、可操作内核的系统接口面。"
 
 [workspace.dependencies]

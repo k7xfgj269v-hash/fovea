@@ -1,48 +1,51 @@
 # Fovea
 
-**Foveate the kernel** —— 名字取自视网膜中央凹（fovea）：视野巨大、带宽有限，于是眼睛只在你正注视的那一点高清、其余低清，靠扫视移动焦点。这正是本项目对海量内核状态所做的——`introspect(pid)` 不倾倒一切，只把「此刻该看的」投影给 AI。
+**English** · [中文](README.zh-CN.md)
 
-> 把一台 Unix 机器改造成 AI 的「玻璃盒」——人照常用 shell，额外给 AI 一层能全内省、可操作内核的系统接口面。
+[![CI](https://github.com/k7xfgj269v-hash/fovea/actions/workflows/ci.yml/badge.svg)](https://github.com/k7xfgj269v-hash/fovea/actions/workflows/ci.yml)
+
+**Foveate the kernel.** The name is the retina's *fovea* — the tiny patch of sharpest vision. Your visual field is enormous but bandwidth is scarce, so the eye keeps only the ~2° you are fixating on in high resolution and saccades it to wherever it is needed. That is exactly what this project does to the flood of kernel state: `introspect(pid)` never dumps everything, it projects only *what matters right now* to the AI.
+
+> Turn one Unix box into a **glass box** for AI — humans keep using the shell as usual, while an extra system-interface surface lets an AI fully introspect and operate the kernel.
 >
-> **状态**：设计收敛、骨架启动、M1 第一/第二刀已落。完整设计见 [`docs/DESIGN.md`](docs/DESIGN.md)。
+> **Status**: design converged, skeleton up, the first two cuts of M1 have landed. Full design in [`docs/DESIGN.md`](docs/DESIGN.md).
 
-## 这是什么
+## What it is
 
-一个坐在 Unix 之上的特权 daemon（不是新内核，不是厚运行时框架），给 AI operator 暴露一套 **为 token 而非人眼设计** 的系统接口：
+A privileged daemon that sits **on top of** Unix (not a new kernel, not a thick runtime framework) and exposes a system interface **designed for tokens, not human eyes**:
 
-- **全内省**：看穿每个进程的线程/内存/fd/调用栈，粒度到运行时的函数（透到运行时边界，不是看穿一切）。
-- **操作内核**：从 eBPF 安全干预，到受控的 LKM 无限改写。
-- **安全信封**：让一个会幻觉的操作者安全地拥有 ring0——危险能力关在 eBPF verifier + 宿主侧人审门之后。
+- **Full introspection** — see through every process: threads, memory, fds, call stacks, down to runtime functions (transparent *up to the runtime boundary*, not all-seeing).
+- **Operate the kernel** — from safe eBPF intervention to controlled, unlimited LKM rewriting.
+- **Safety envelope** — let a *hallucinating* operator safely hold ring0. Dangerous capabilities are caged behind an eBPF verifier plus a host-side human-review gate.
 
-最接近的现成参照：**整机级、系统化的 MCP**。
+The closest existing analogy: a **machine-wide, systematic MCP**.
 
-## 为什么 — 真正新的是这两件事
+## Why — the two things that are genuinely new
 
-不是「内核内省」（那是已知硬骨头、不 AI 特有）。真正新、真正难的是：
+It is *not* "kernel introspection" (a known hard problem, not AI-specific). What is actually new and actually hard:
 
-1. **上下文虚拟化 / 投影**：内核状态海量（进程内存 GB 级、ftrace 几百万条、kcore 是整个内核内存），AI 上下文装不下。难点不是抓数据，是喂之前「此刻该看什么」。这是全篇皇冠明珠，落在 [`introspect(pid)`](crates/introspect-schema/src/lib.rs) 上逼到可解小面：一个 pid 的「什么进 Level 0、什么藏 handle 后」就是投影策略的最小实例。
-2. **怎么安全共享一台真机**：人 + AI 共用同一台真机、AI 手握 kcore + 内核写能力，逼出信任边界 / 仲裁 / 透明性 / 审计一整套。信任边界物理落地为 VM 边界 = 宿主/靶机边界。
+1. **Context virtualization / projection.** Kernel state is enormous — process memory in GBs, ftrace in millions of lines, `kcore` is the entire kernel's memory. It does not fit an AI's context window. The hard part is not *capturing* the data, it is deciding **"what should I look at right now"** before feeding it. This is the crown jewel, and it is forced down to a solvable face on [`introspect(pid)`](crates/introspect-schema/src/lib.rs): for a single pid, "what goes into Level 0 vs. what hides behind a handle" is the minimal instance of the projection policy.
+2. **How to safely share one real machine.** A human and an AI on the *same real box*, with the AI holding `kcore` plus kernel-write, forces an entire apparatus of trust boundary / arbitration / transparency / audit. The trust boundary lands physically as the **VM boundary = host/guest boundary**.
 
-更多公理速览见 [`docs/README.orig.md`](docs/README.orig.md)，完整推演见 [`docs/DESIGN.md`](docs/DESIGN.md) §14。
+Full axioms and derivation live in [`docs/DESIGN.md`](docs/DESIGN.md) §14.
 
-## 仓库结构
+## Repository layout
 
-**信任边界物理落地**——四 crate 分工、依赖图无环：
+The trust boundary made physical — four crates, clean split, acyclic dependency graph:
 
 ```
 fovea/
-├── Cargo.toml                       # workspace 根，依赖经 workspace.dependencies 集中
+├── Cargo.toml                       # workspace root; deps centralized via workspace.dependencies
 ├── crates/
-│   ├── introspect-schema/           # 跨 vsock 信任边界的合同：Level0/Level1 字段（§10/§13.4）
-│   ├── vsock/                        # 宿主↔靶机控制通道抽象：Transport trait + MockTransport
-│   ├── guest-agent/                  # 靶机侧（不可信数据面）：introspect 引擎 + proc_view + symbolize
-│   └── host-supervisor/              # 宿主侧（可信控制面）：AuditSink + HumanGate trait
+│   ├── introspect-schema/           # the cross-vsock contract: Level0/Level1 fields (§10 / §13.4)
+│   ├── vsock/                        # host↔guest control channel: Transport trait + MockTransport
+│   ├── guest-agent/                 # guest side (untrusted data plane): introspect engine + proc_view + symbolize
+│   └── host-supervisor/             # host side (trusted control plane): AuditSink + HumanGate traits
 └── docs/
-    ├── DESIGN.md                     # 完整设计文档（架构/接口/难题/实现蓝图）
-    └── README.orig.md                # 原设计仓 README（公理速览/里程碑速览）
+    └── DESIGN.md                    # full design doc (architecture / interfaces / hard problems / build blueprint)
 ```
 
-依赖方向（`A → B` = A 依赖 B，无环；`introspect-schema` 是唯一叶子）：
+Dependency direction (`A → B` = A depends on B, acyclic; `introspect-schema` is the only leaf):
 
 ```
 vsock            → introspect-schema
@@ -50,68 +53,78 @@ guest-agent      → introspect-schema
 host-supervisor  → vsock → introspect-schema
 ```
 
-guest-agent 与 host-supervisor 互不引用——跨边界契约只由 `introspect-schema` crate 锁死，不靠 crate 互引。
+`guest-agent` and `host-supervisor` never reference each other — the cross-boundary contract is pinned solely by the `introspect-schema` crate, not by crate interdependence.
 
-### 各 crate 当前定位
+### Crate status
 
-| crate | 角色 | 已落成 |
+| Crate | Role | Landed |
 |---|---|---|
-| **introspect-schema** | 跨边界合同，零运行时依赖 | Level0 全 9 字段（identity/state/resource/mem_shape/hotspot/recent/confidence/handles/cost_hint）字段级；§10 三断言钉死（per-frame 置信度、wchan 进 Level0、cost_hint §12 形状 `{token, api_cost?, overhead_est}`）；Level1 `view` enum 提前占位 |
-| **vsock** | 信任边界的物理实现 | `Transport` trait + `MockTransport`；`Message`/`Request`/`Response`/`AuditEvent`/`ErrorReport` 形状；§13.6 单向 append-only、§13.8 副作用五档路由（`read`/`dry-runnable-write`/`intervention`/`kernel-write`/`irreversible`） |
-| **guest-agent** | 靶机侧不可信数据面 | `introspect::engine::introspect` 已从 stub 转为真实现：`/proc` 解析（stat/status/maps/wchan/fd/stack）→ 组装 `Level0`；`proc_view` 6 个纯解析函数；`symbolize` trait + `FallbackSymbolizer`（非 Linux 诚实返 `NotFound`，**M1 引擎实际用的是它**）+ `BlazeSymbolizer`（Linux-only blazesym 接入**骨架**，尚未 wire 进 `introspect`、Mac 上 cfg-out 故未编译验证）；`ProcError` serde 内部标签加固 + 回归测试钉住 |
-| **host-supervisor** | 宿主侧可信控制面 | `AuditSink` trait + `InMemoryAuditSink`（单测绿）；`HumanGate` trait + `GateDecision` + `LkmParamGate`（占位 `Allow`）；trait 位置在位，值待 M5 纳真 |
+| **introspect-schema** | cross-boundary contract, zero runtime deps | Level0 all 9 fields (`identity` / `state` / `resource` / `mem_shape` / `hotspot` / `recent` / `confidence` / `handles` / `cost_hint`) at field granularity; §10's three assertions nailed (per-frame confidence, `wchan` in Level0, `cost_hint` shape `{token, api_cost?, overhead_est}`); Level1 `view` enum stubbed ahead of time |
+| **vsock** | physical realization of the trust boundary | `Transport` trait + `MockTransport`; `Message` / `Request` / `Response` / `AuditEvent` / `ErrorReport` shapes; §13.6 one-way append-only, §13.8 five-tier side-effect routing (`read` / `dry-runnable-write` / `intervention` / `kernel-write` / `irreversible`) |
+| **guest-agent** | untrusted data plane (guest side) | `introspect::engine::introspect` is now real (no longer a stub): `/proc` parsing (stat/status/maps/wchan/fd/stack) → assemble `Level0`; `proc_view`'s 6 pure parsers; `symbolize` trait + `FallbackSymbolizer` (honest `NotFound` off-Linux — **this is what M1 actually uses**) + `BlazeSymbolizer` (Linux-only blazesym **skeleton**, not yet wired into `introspect`, `cfg`-out on Mac so unverified locally); `ProcError` serde hardening + regression tests |
+| **host-supervisor** | trusted control plane (host side) | `AuditSink` trait + `InMemoryAuditSink` (unit-tested green); `HumanGate` trait + `GateDecision` + `LkmParamGate` (placeholder `Allow`); traits in place, real values land in M5 |
 
-## 当前进度
+## Milestones (M0–M9)
 
-按 [DESIGN.md §13.9](docs/DESIGN.md) 里程碑 M0–M9：
+Safety scaffold before write capability — see [`docs/DESIGN.md`](docs/DESIGN.md) §13.9.
 
-| 里程碑 | 做什么 | 状态 |
-|---|---|---|
-| **M1** | 只读 `introspect(pid)` Level 0：`/proc` + blazesym，零探针 | ✅ 形态全长齐；Linux 真 `/proc` I/O 已 cfg-gate 就位；Mac 走 `introspect_with_inputs` 纯函数单测盯住组装形态 |
-| **M5** | 宿主侧审计 sink（意图）+ 仲裁器 + 干预门 hook（事前） | 🟡 trait 全在位，实现待纳真 |
-| **M0** | VM 基座：QEMU/KVM + virtio-vsock + savevm + gdb | ⬜ 未动；真 `Transport` 实现等它 |
-| **M2–M4, M6–M9** | MCP front / Level 1 views / 飞行记录仪 / eBPF 观测+干预 / fs 事务 / LKM 参数化 | ⬜ 未动 |
+| Milestone | What it builds | What it proves | Status |
+|---|---|---|---|
+| **M0** | VM harness: host + guest, vsock, `savevm`/`loadvm`, gdb stub | base runs, rolls back in a snap, can debug the kernel | ⬜ not started |
+| **M1** | read-only `introspect(pid)` Level 0: `/proc` + blazesym, zero probes | projection holds (GB maps → a dozen lines) | ✅ shape complete |
+| **M2** | MCP front: `introspect` as an MCP tool + self-describing catalog | the capability surface takes shape | ⬜ |
+| **M3** | `introspect` Level 1 views + `cost_hint` + confidence | projection / paging / cost become schedulable | ⬜ |
+| **M4** | flight recorder: resident ring buffer, ultra-low perturbation | transient events get caught | ⬜ |
+| **M5** | **host-side audit sink + arbiter (human-first + teardown) + intervention gate hook** | **the safety scaffold (incl. the pre-emptive gate) — before any write capability** | 🟡 traits in place |
+| **M6** | eBPF observation channel: on-demand probes + effect audit | read side complete | ⬜ |
+| **M7** | eBPF intervention channel (override / drop) + passively discoverable | first write capability, verifier as the backstop | ⬜ |
+| **M8** | fs transactions: dry-run diff + point rollback | fs writes previewable and revertible | ⬜ |
+| **M9** | LKM parameterized primitive modules + human gate | the last, most dangerous capability, parameterized | ⬜ |
 
-**关键的诚实**：M1 已落的是**形态**——纯函数解析层 + 引擎组装在 Mac 单测里跑通，真 `/proc` I/O cfg-gate 到 Linux 才编；blazesym 的真内核态路径（`vmlinux`/`kallsyms` 路径配置）仍标 `TODO(M0)`，等 VM 基座搭起来一次性补。本仓当前环境**无 Rust 工具链**，以上均为静态审读、未经 `cargo check`/`cargo test`。
+## Honest status
 
-**已知缺口（本轮审出的 M1 债务，M0 端到端前修）**：
+**What M1 actually landed is the *shape*** — a pure-function parsing layer plus engine assembly, running green in Mac unit tests. The real `/proc` I/O is `cfg`-gated to Linux and only compiles there; blazesym's real kernel-side path (`vmlinux` / `kallsyms` config) is still marked `TODO(M0)`, to be filled in once the VM base exists.
 
-- **`resource.ctxt_switches` 取错源**：读的是 `/proc/<pid>/stat` 字段 40/41，而那是 `rt_priority`/`policy`，**不是**上下文切换数——真源在 `/proc/<pid>/status` 的 `voluntary_ctxt_switches:` 行。真 Linux 上会静默给错数；Mac 单测用同构 fixture（把值放进 idx 37/38）恰好测不出。
-- **`build_cmdline` 可 panic**：`String::truncate(256)` 落在非 UTF-8 字符边界会 panic；cmdline 是不可信输入，含多字节字符时可触发。
-- **`confidence` 只做了一半**：实现了 §11 ①（wchan/顶帧交叉验证），未实现 ②（每帧符号化失败入 `low_fields`）。M1 用 Fallback 时每帧都符号化失败，`overall` 却报 1.0——与公理 11「告诉你它有多不确定」相悖。
+Locally there is **no Rust toolchain**, so everything above was static review, never `cargo check`/`cargo test`. **CI (GitHub Actions, ubuntu) now provides the first real compilation** — including, for the first time, the `#[cfg(target_os = "linux")]` paths (`BlazeSymbolizer`, the real `/proc` I/O) that never compile on Mac. Watch the badge above.
 
-> 讽刺点：这三条都是「读侧静默污染」（§11）——引擎自己先踩了它要防的坑。均不阻塞编译，M0 前修。
+**Known gaps** (M1 debts found in review, to fix before the M0 end-to-end):
 
-## 怎么跑
+- **`resource.ctxt_switches` reads the wrong source** — it reads `/proc/<pid>/stat` fields 40/41, which are `rt_priority`/`policy`, **not** context-switch counts. The real source is the `voluntary_ctxt_switches:` line in `/proc/<pid>/status`. On real Linux this silently returns wrong numbers; the Mac unit test uses an isomorphic fixture (values placed at idx 37/38) that happens to miss it.
+- **`build_cmdline` can panic** — `String::truncate(256)` on a non-UTF-8 char boundary panics; `cmdline` is untrusted input and can trigger this with multi-byte characters.
+- **`confidence` is only half done** — §11 ① (wchan / top-frame cross-check) is implemented, ② (each frame's symbolization failure into `low_fields`) is not. Under M1's `Fallback` every frame fails to symbolize, yet `overall` reports `1.0` — contradicting axiom 11 ("tell you how uncertain it is").
 
-需要 Rust stable 工具链（edition 2021）。
+> The irony: all three are "silent read-side contamination" (§11) — the engine tripped over the very pit it is meant to guard. None block compilation; fix before M0.
+
+## Build & run
+
+Requires the Rust stable toolchain (edition 2021). The pinned toolchain lives in [`rust-toolchain.toml`](rust-toolchain.toml).
 
 ```bash
-cargo check --all-targets           # 编译全部 4 crate（含 bin stub）
-cargo test                          # 跑单测（schema + vsock + guest-agent + host-supervisor）
-cargo run -p guest-agent            # bin stub，当前无 daemon 逻辑
-cargo run -p host-supervisor         # bin stub，当前无 listener
+cargo check --all-targets    # compile all 4 crates (incl. bin stubs)
+cargo test                   # unit tests (schema + vsock + guest-agent + host-supervisor)
+cargo run -p guest-agent     # bin stub — no daemon logic yet
+cargo run -p host-supervisor # bin stub — no listener yet
 ```
 
-> 非 Linux（含 Mac）上 `introspect()` cfg-gate 直接返 `NotImplemented`，不真读 `/proc`；纯函数形态由 `introspect_with_inputs` 在单测里盯住——这是「cfg-gate 到 Linux，但 Level0 组装形态在 Mac 单测」这一刀的实现。
+> On non-Linux (incl. Mac), `introspect()` `cfg`-gates straight to `NotImplemented` and never touches `/proc`; the pure-function shape is held by `introspect_with_inputs` in unit tests — that is the realization of "`cfg`-gate to Linux, but hold the Level0 assembly shape in Mac unit tests".
 
-## 怎么读
+## Reading guide
 
-- **快速对齐**：`docs/DESIGN.md` §1（定位）、§2（心理模型、稀缺资源翻转表）、§14（公理）。
-- **要动手**：§10（`introspect(pid)` 原语 + 钉死三断言）、§13（实现蓝图）、§13.9（里程碑）。
-- **关心风险**：§8（信任/仲裁/透明性/三件套）、§9（回滚分层）、§11（静默污染读写两侧）。
-- **本仓库代码契合点**：
-  - 「皇冠明珠第一刀」 = [`crates/introspect-schema/src/lib.rs`](crates/introspect-schema/src/lib.rs) 的 `MemShape` 段（GB maps → 十几行的投影本体）
-  - 信任边界两半物理实现 = [`crates/guest-agent/`](crates/guest-agent/) ↔ [`crates/host-supervisor/`](crates/host-supervisor/)、走 [`crates/vsock/`](crates/vsock/)
-  - 公理 13「脚手架先于写能力」M1 最小实例 = [`crates/host-supervisor/src/audit.rs`](crates/host-supervisor/src/audit.rs) 的 `AuditSink` 在 M1 就 trait 在位
-  - §10 三断言的代码归宿 = [`crates/guest-agent/src/introspect.rs`](crates/guest-agent/src/introspect.rs)（每次带 `cost_hint`、wchan 进 Level0、每帧 `SymbolConfidence`）
+- **Quick alignment** — `docs/DESIGN.md` §1 (positioning), §2 (mental model, the scarce-resource inversion table), §14 (axioms).
+- **Getting hands-on** — §10 (`introspect(pid)` primitive + the three nailed assertions), §13 (build blueprint), §13.9 (milestones).
+- **Risk-minded** — §8 (trust / arbitration / transparency), §9 (layered rollback), §11 (silent contamination, read and write sides).
+- **Where the code meets the doc**:
+  - "First cut of the crown jewel" = the `MemShape` section of [`crates/introspect-schema/src/lib.rs`](crates/introspect-schema/src/lib.rs) (GB maps → a dozen-line projection).
+  - The two halves of the trust boundary = [`crates/guest-agent/`](crates/guest-agent/) ↔ [`crates/host-supervisor/`](crates/host-supervisor/), over [`crates/vsock/`](crates/vsock/).
+  - Axiom 13 "scaffold before write capability", minimal M1 instance = the `AuditSink` trait in [`crates/host-supervisor/src/audit.rs`](crates/host-supervisor/src/audit.rs), present from M1.
+  - The three assertions' code home = [`crates/guest-agent/src/introspect.rs`](crates/guest-agent/src/introspect.rs) (every call carries `cost_hint`, `wchan` in Level0, per-frame `SymbolConfidence`).
 
-## 下一步
+## Next steps
 
-按 `docs/DESIGN.md` §15 留的路径（**0 号插队**：先清上面 3 条 M1 债务，尤其 `ctxt_switches`——M0 一上真 Linux 就冒静默错数）：
+Following the path left in `docs/DESIGN.md` §15 (**priority 0**: clear the three M1 debts above first, especially `ctxt_switches` — it surfaces silent wrong numbers the moment M0 hits real Linux):
 
-1. **M0 VM 基座**：QEMU/KVM + virtio-vsock + savevm/loadvm + gdb stub；之后 `vsock` 的真 `Transport` 实现就位，替掉 `MockTransport`，blazesym 的真内核态路径（`vmlinux`/`kallsyms`）一次性配置，`introspect` 在靶机内端到端跑通。
-2. **M2 MCP front**：把 `introspect` 包成 MCP tool + 自描述目录（§13.8 副作用等级一等字段）。
-3. **M5 纳真**：append-only 文件 sink + 真人审门 + 事前干预 hook（M7 伸手前栅栏先在位）——公理 13 的全落地。
+1. **M0 VM base** — QEMU/KVM + virtio-vsock + savevm/loadvm + gdb stub; then the real `Transport` impl replaces `MockTransport`, blazesym's real kernel path (`vmlinux`/`kallsyms`) gets configured in one shot, and `introspect` runs end-to-end inside the guest.
+2. **M2 MCP front** — wrap `introspect` into an MCP tool + self-describing catalog (§13.8 side-effect level as a first-class field).
+3. **M5 hardening** — append-only file sink + real human gate + pre-emptive intervention hook (the fence is in place *before* M7 reaches in) — the full landing of axiom 13.
 
-> 顺序铁律（§13.9 / 公理 13）：**先造牢笼——含事前那道栅栏——AI 才被允许伸手。别让任何写能力 predate 它的容器。**
+> **The iron rule** (§13.9 / axiom 13): build the cage first — including that pre-emptive fence — *before* the AI is allowed to reach in. Never let any write capability predate its container.
