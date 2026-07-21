@@ -1,4 +1,6 @@
-# AI-Native OS
+# Fovea
+
+**Foveate the kernel** —— 名字取自视网膜中央凹（fovea）：视野巨大、带宽有限，于是眼睛只在你正注视的那一点高清、其余低清，靠扫视移动焦点。这正是本项目对海量内核状态所做的——`introspect(pid)` 不倾倒一切，只把「此刻该看的」投影给 AI。
 
 > 把一台 Unix 机器改造成 AI 的「玻璃盒」——人照常用 shell，额外给 AI 一层能全内省、可操作内核的系统接口面。
 >
@@ -28,7 +30,7 @@
 **信任边界物理落地**——四 crate 分工、依赖图无环：
 
 ```
-ai-native-os/
+fovea/
 ├── Cargo.toml                       # workspace 根，依赖经 workspace.dependencies 集中
 ├── crates/
 │   ├── introspect-schema/           # 跨 vsock 信任边界的合同：Level0/Level1 字段（§10/§13.4）
