@@ -87,6 +87,8 @@ Safety scaffold before write capability — see [`docs/DESIGN.md`](docs/DESIGN.m
 
 Locally there is **no Rust toolchain**, so everything above was static review, never `cargo check`/`cargo test`. **CI (GitHub Actions, ubuntu) now provides the first real compilation** — including, for the first time, the `#[cfg(target_os = "linux")]` paths (`BlazeSymbolizer`, the real `/proc` I/O) that never compile on Mac. Watch the badge above.
 
+> ⚠️ **CI is red right now — by design.** That first Linux compile surfaced 40 errors, all in the WIP `BlazeSymbolizer` backend: blazesym 0.2.5's `Symbolizer` is `!Send + !Sync` (interior `RefCell`/`Rc`), clashing with our `Symbolizer: Send + Sync` trait; plus a moved API path (`Source`) and the `ctxt_switches` field debt below. The `FallbackSymbolizer` path that M1 actually uses is unaffected. The blazesym backend gets wired in at M0 — the badge stays red until then.
+
 **Known gaps** (M1 debts found in review, to fix before the M0 end-to-end):
 
 - **`resource.ctxt_switches` reads the wrong source** — it reads `/proc/<pid>/stat` fields 40/41, which are `rt_priority`/`policy`, **not** context-switch counts. The real source is the `voluntary_ctxt_switches:` line in `/proc/<pid>/status`. On real Linux this silently returns wrong numbers; the Mac unit test uses an isomorphic fixture (values placed at idx 37/38) that happens to miss it.

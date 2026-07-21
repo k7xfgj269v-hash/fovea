@@ -87,6 +87,8 @@ guest-agent 与 host-supervisor 互不引用——跨边界契约只由 `introsp
 
 本地**无 Rust 工具链**，以上均为静态审读、未经 `cargo check`/`cargo test`。**CI（GitHub Actions, ubuntu）现在提供第一次真实编译**——包括 Mac 上永远 cfg-out、从没编过的 `#[cfg(target_os = "linux")]` 路径（`BlazeSymbolizer`、真 `/proc` I/O）。看上方徽章。
 
+> ⚠️ **CI 现在是红的——预期之内。** 首次 Linux 编译逐出 40 个错，全在 WIP 的 `BlazeSymbolizer` 后端：blazesym 0.2.5 的 `Symbolizer` 是 `!Send + !Sync`（内部 `RefCell`/`Rc`），与本项目 `Symbolizer: Send + Sync` trait 冲突；外加一处 API 路径搬家（`Source`）和下方的 `ctxt_switches` 字段债务。M1 实际用的 `FallbackSymbolizer` 路径不受影响。blazesym 后端在 M0 接入——在那之前徽章保持红色。
+
 **已知缺口（本轮审出的 M1 债务，M0 端到端前修）**：
 
 - **`resource.ctxt_switches` 取错源**：读的是 `/proc/<pid>/stat` 字段 40/41，而那是 `rt_priority`/`policy`，**不是**上下文切换数——真源在 `/proc/<pid>/status` 的 `voluntary_ctxt_switches:` 行。真 Linux 上会静默给错数；Mac 单测用同构 fixture（把值放进 idx 37/38）恰好测不出。
