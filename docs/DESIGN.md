@@ -1,6 +1,6 @@
-# AI-Native OS —— 完整设计文档
+# Fovea —— AI 控制内核设计文档
 
-> **日期**：2026-07-07　**状态**：架构收敛（实现蓝图已可执行，尚未写代码）
+> **日期**：2026-07-23　**状态**：架构基线收敛；实现进入 M1，Linux 路径尚未跑绿
 > 本文是可指导实现的完整设计。快速导航见项目根 `README.md`。
 > **阅读指引**：想快速对齐看 §1、§2、§14；要动手看 §10、§13；关心风险看 §8、§9、§11。
 
@@ -10,12 +10,15 @@
 
 ### 1.1 一句话定义
 
-把一台 Unix 机器改造成 AI 的**「玻璃盒」**——底层仍是 Unix、人照常用 shell/GUI，额外做**一层给 AI 的系统接口面**，让 AI 能 **全内省（看穿到运行时边界）+ 操作内核（在安全信封内改）**。
+把一台 Linux 机器改造成 AI 的**「玻璃盒」**——Linux 继续充当**机制内核**，Fovea 在其上充当 **AI 控制内核**：把模型意图翻译成带 schema、成本、权限、审批、审计和回滚语义的系统操作。
 
-- 它**不是**新内核，也**不是**在 Linux 上叠一个厚运行时框架。
-- 它是坐在 Unix 之上的 **guest-agent + host-supervisor 两半**：人走 shell，AI 走 daemon，两条通道共享同一台真机的状态；**信任边界 = 宿主 / 靶机边界**。
+- 它**不是**新 ring0 内核，也不重写调度、内存管理、驱动和 Linux ABI。
+- Linux 提供 `/proc`、eBPF、BTF、perf、namespace、KVM 等机制；Fovea 负责投影、能力、预算、门、审计、仲裁和回滚策略。
+- 它由 **guest-agent + host-supervisor 两半**组成：人走 shell；AI 的 MCP 请求只进入宿主侧 host-supervisor，再由宿主经 vsock 下发已分类、已记账、必要时已审批的内部执行请求。**信任边界 = 宿主 / 靶机边界**。
 - 最接近的现成参照：**整机级、系统化的 MCP**（现有 MCP 是零散的 per-tool；这里要覆盖 fs/proc/net/pkg/job/事务/内核内省一整套，还要吃下 Unix 生态长尾）。
 
+> **「控制内核」是架构角色，不是 CPU 特权级。** Fovea 不取代 Linux 内核；它像一个面向 AI operator 的系统控制面，决定模型能看什么、能做什么、代价多少、谁批准、如何留痕，以及出事后在哪一层停止或回滚。
+>
 > 范围诚实：是「看穿到**运行时边界**」，不是字面「看穿一切」。托管运行时（V8/JVM/LuaJIT）内部按优雅降级处理，见 §11。
 
 ### 1.2 三种读法，选了哪个
@@ -26,7 +29,7 @@
 2. AI 是负载（workload） — 跑推理/训练，GPU/显存/算子一等公民，本质 HPC。
 3. AI 是内核决策者 — 用学到的策略替换 OS 启发式（调度/换页），偏 paper。
 
-**收窄链**：operator 视角 → 不重写内核、不叠厚运行时 → 一层薄的 AI 友好接口面 → **下沉到内核级的内省 + 操作**。
+**收窄链**：operator 视角 → Linux 保持机制内核 → Fovea 做 AI 控制内核 → 一层薄的 AI 友好接口面 → **下沉到内核级的内省 + 操作**。
 
 ### 1.3 皇冠明珠：真正的新问题在哪
 
@@ -34,6 +37,22 @@
 
 1. **上下文虚拟化 / 投影**：内核状态是海量的（进程内存 GB 级、ftrace 几百万条、kcore 是整个内核内存），AI 上下文装不下。难点不是抓数据，是喂之前「此刻该看什么」的投影。这个问题在 §2.1 以「稀缺资源」、在 §6 以「上下文爆炸」**出现两次——是同一个问题**，是全篇皇冠明珠。§10 的 `introspect(pid)` 就是把它逼到一个可解的小面上。
 2. **怎么安全地共享一台真机**：人和 AI 共用同一台真机，而 AI 手握 kcore + 内核写能力。信任边界、仲裁、透明性、审计一整套（§8）由此而来。
+
+### 1.4 外部内核路线的借鉴边界
+
+Fovea 采用**组合式路线**，但不把任何参考系统变成新的运行基座：
+
+| 参考路线 | 借什么 | 落到 Fovea 哪里 | 明确不做什么 |
+|---|---|---|---|
+| **Linux** | 成熟 ABI、eBPF/BTF、perf、KVM、namespace | 唯一实际机制内核和靶机基座 | 不 fork 内核、不维护私有 syscall |
+| **seL4 / Genode** | capability、最小可信基、资源委托与配额 | host-supervisor 的授权、预算和组件边界 | 不把 Fovea 移植成 seL4 系统 |
+| **Zircon** | typed handle、权利随 handle 传递、结构化 IPC | Level 1 handle、跨边界协议和对象生命周期 | 不复制 Zircon 内核对象模型 |
+| **QNX / Hubris** | 小 supervisor、服务故障隔离、可重启用户态组件 | host/guest 服务监督与失败恢复 | 不把 Linux 驱动整体搬到用户态 |
+| **Asterinas** | Rust 安全边界、Linux 兼容内核服务的组织方式 | 跟踪内存安全实现经验 | 在其硬件/驱动成熟前不作为基座 |
+| **Unikraft** | 单用途、短生命周期、可销毁 guest | 后期高风险 agent 的一次性执行环境 | 不用于人机共享主靶机 |
+| **CHERI** | 硬件 capability、细粒度指针权限 | 长期约束驱动/LKM 内存访问的研究方向 | 当前不把实验硬件写进交付前提 |
+
+**边界决策**：Fovea 的创新放在 AI 控制面，不放在重新实现调度器、页表、驱动栈或 POSIX。参考系统只提供经过验证的设计语言；Linux 机制仍是运行时事实来源。
 
 ---
 
@@ -234,11 +253,15 @@ eBPF（含 helper/kfunc/struct_ops）现在能覆盖的很多。真无限改写�
 
 问题：审批门 / 仲裁器 / 审计，在不在 AI 的可触及范围内？AI 手握 kcore + LKM，如果这些东西跑在靶机内，AI 原则上能观测甚至改写**约束它自己的门**（§5 的 eBPF verifier 答案在这层不成立：verifier 保证不崩，不保证 AI 碰不到自己的 gate）。
 
-**决策：一切可信控制面坐宿主侧，VM 边界 = 信任边界。**
+**决策：一切可信控制面和所有 AI 外部入口坐宿主侧，VM 边界 = 信任边界。**
+
+AI 不能直接连接 guest-agent。MCP front 必须属于 host-supervisor：宿主先从请求 variant **自行推导**副作用等级，执行预算/审批/仲裁，将 allow/deny 决定在任何 dispatch 前写入意图审计；只有 allow 才通过 vsock 下发内部请求。副作用等级不能由靶机或模型随请求自报，否则不可信侧可以把 `kernel-write` 谎报成 `read`。
 
 代价（明写、接受）：**宿主侧的门只能 gate「加载」这个动作，gate 不了 eBPF/LKM 加载后在靶机内核里的运行时行为**。一段合法通过 verifier、逻辑幻觉的探针，宿主拦不住 → 这个残缺的后果交给 §8.4（效果审计）+ §11（静默污染检测）处理。**永远别假装门能管运行时；门只管入口。**
 
-物理实现见 §13.2：daemon 拆成 guest-agent（靶机内，做内省/挂探针）+ host-supervisor（宿主，做审计/门/仲裁/快照），**信任边界就是这两半之间的 vsock**。
+威胁边界也要说清：上述门约束的是 **Fovea 正常控制路径中的模型请求**。如果靶机内核或 guest-agent 已被完全接管，宿主无法证明它没有绕开协议直接修改自身内核；此时安全保证降级为 **VM containment + 停机/回滚 + 宿主侧意图账不被篡改**，而不是继续声称宿主能控制靶机内部每条指令。
+
+物理实现见 §13.2：daemon 拆成 guest-agent（靶机内，做内省/挂探针）+ host-supervisor（宿主，承接 MCP、做审计/门/仲裁/快照），**信任边界就是这两半之间的 vsock**。
 
 ### 8.2 仲裁：人永远优先 + 干净拆除
 
@@ -269,18 +292,19 @@ eBPF（含 helper/kfunc/struct_ops）现在能覆盖的很多。真无限改写�
 
 **「非必要不开」的精确含义**：关的是**实时视图/tail**，不是**记录**。记录关掉是 bug——写侧行为和瞬态事件同一个物理问题（§7.2），没记就是永久丢失。**记录恒开、视图按需。**
 
-### 8.4 审计两层（便宜那半正好够用）
+### 8.4 审计三流：意图、回执、效果
 
 | 审计层 | 采集 | 成本 | 回答 |
 |---|---|---|---|
-| **意图审计** | AI 决定装什么 / 改什么参数，每条 attach/detach/config/参数全记 | 低频、便宜、完整 | 「发生了什么」**主要**靠它 |
-| **效果审计** | 探针运行时**实际**干了多少（丢多少包、override 触发几次） | 高频、采样、best-effort | 「实际影响多大」——撞观测量墙 |
+| **意图审计** | host-supervisor 收到、拒绝、批准和下发了什么；在 dispatch 前写入 | 低频、便宜、对 Fovea 控制路径完整 | 「Fovea 授权了什么」靠它 |
+| **执行回执** | guest-agent 声称执行成功/失败、返回对象 id 等 | 低频，但来自不可信侧 | 「靶机声称做了什么」 |
+| **效果审计** | 探针运行时**实际**干了多少（丢多少包、override 触发几次） | 高频、采样、best-effort，来自不可信侧 | 「实际影响可能多大」——撞观测量墙 |
 
-> 铁律：**你没法全保真审计一个你没法全保真观测的东西**。意图审计能完整，是因为「意图」低频；效果审计只能采样，因为它是运行时高频流。别把两者混谈。
+> 铁律：**宿主只能对自己授权和下发的意图给出权威记录，不能把靶机回执当成地面真值。** 你也没法全保真审计一个你没法全保真观测的东西：效果审计只能采样，且靶机完全失陷时可被省略或伪造。别把意图、回执和效果三者混谈。
 
 ### 8.5 小结：玻璃盒对人从半透明修回准透明的三件套
 
-1. 意图审计恒开（§8.4），sink 在宿主（§8.1）——AI 改不了自己的账。
+1. 意图审计恒开且在 dispatch 前由宿主生成（§8.4），sink 在宿主（§8.1）——AI 改不了宿主授权账。
 2. 干预类探针被动可发现（§8.3）——人默认视图关也能查出活体修改。
 3. 干净拆除（§8.2 / §13.5）——人一键收回 AI 对内核的所有挂载。
 
@@ -385,12 +409,12 @@ introspect(pid, view=maps|threads|stack|fds, cursor=…, fields=[…], page=…)
 |---|---|---|
 | **daemon 语言** | **Rust** | ① 控制面不能有 GC 停顿；② 内存安全——最不该崩的那个组件（可信 harness）不该用最不安全的语言写，C 在这里讽刺；③ eBPF 生态成熟；④ tokio 处理并发的 请求/tail/审计 流 |
 | **eBPF 加载** | **libbpf-rs**（CO-RE via BTF） | 成熟 + CO-RE 经过验证。备选 aya（纯 Rust、免 clang 运行时依赖）更年轻，CO-RE 可靠性优先选 libbpf-rs |
-| **符号化 + 回溯** | **blazesym**（libbpf 组织出品） | 统一处理 ELF/DWARF/kallsyms/gsym + DWARF/ORC 回溯。**这是最重要的库选择——符号化质量 = 内省质量（§4.2）** |
+| **符号化 + 回溯** | **blazesym**（独立 worker 独占实例） | 统一处理 ELF/DWARF/kallsyms/gsym + DWARF/ORC 回溯。其内部状态不满足跨线程共享合同，guest 内由专用 worker 创建并持有，其他 task 通过 channel 请求；禁止用 `unsafe impl Send/Sync` 掩盖边界。**符号化质量 = 内省质量（§4.2）** |
 | **BPF 程序** | C + clang → BPF 字节码，CO-RE 重定位到靶机 BTF | 标准 CO-RE 路线，躲偏移地狱 |
 | **对 AI 线格式** | **JSON**（可投影、可分页，§2.2） | 内部用 Rust 强类型，出口序列化成 JSON |
-| **AI ↔ daemon 传输** | **MCP**（§1.1），stdio 或 SSE | daemon 本身就是个 MCP server |
-| **宿主 ↔ 靶机控制通道** | **virtio-vsock** | 不走靶机网络（AI 能搞网络），host↔guest 直连，审计 ship + 命令下发都走它 |
-| **VM** | **QEMU/KVM** | 全状态快照 savevm/loadvm、`-s -S` gdb stub、`kvm_intel.pt_mode=1` 试 guest PT |
+| **AI ↔ 控制面传输** | **host-supervisor 上的 MCP**，stdio 或 SSE | AI 外部入口必须先经过可信侧的分类、预算、门和意图审计；guest-agent 不暴露 MCP |
+| **宿主 ↔ 靶机控制通道** | **virtio-vsock** | 不走靶机网络；host 下发内部执行请求，guest 回传 response/receipt/effect telemetry |
+| **VM** | **Linux x86_64 + QEMU/KVM** 为 M0 基线 | 全状态快照 savevm/loadvm、`-s -S` gdb stub、`kvm_intel.pt_mode=1` 试 guest PT；Apple Silicon Mac 只做编辑、静态检查和非等价 HVF 开发，不作为 M0 验收环境 |
 
 ### 13.2 进程拓扑：guest-agent + host-supervisor（信任边界的物理实现）
 
@@ -399,17 +423,22 @@ introspect(pid, view=maps|threads|stack|fds, cursor=…, fields=[…], page=…)
 ```
 ┌─────────────────── 宿主机（可信侧） ───────────────────┐
 │  host-supervisor (Rust)                               │
-│   ├─ 审计 sink（append-only，意图+效果）  ← AI 够不着  │
+│   ├─ MCP front（唯一 AI 外部入口）                     │
+│   ├─ capability dispatcher（副作用分类 + 预算）        │
+│   ├─ 意图审计 sink（dispatch 前 append） ← AI 够不着   │
 │   ├─ 人审门（LKM 参数审批）                            │
 │   ├─ 仲裁器（人永远优先 + 触发干净拆除）               │
 │   ├─ VM 快照控制（QMP: savevm/loadvm）                 │
 │   └─ 人的 shell / 审计 tail 视图（按需开）             │
-│                         ↑ virtio-vsock（= 信任边界）   │
+│                         ↓ 已授权 request               │
+│                         ↑ response/receipt/effect      │
+│                    virtio-vsock（= 信任边界）          │
 └─────────────────────────┼─────────────────────────────┘
 ┌─────────────────── 靶机 VM（不可信侧） ─────────────────┐
 │  guest-agent (Rust)                                   │
-│   ├─ MCP front（能力面：具名 verb + 逃生舱 exec）      │
+│   ├─ 内部执行 RPC（只接 host vsock，不暴露 MCP）       │
 │   ├─ 内省引擎（introspect：/proc + blazesym，零探针）  │
+│   ├─ symbolizer worker（独占 blazesym 实例）           │
 │   ├─ probe manager（eBPF 生命周期 + flush 拆除）       │
 │   ├─ 飞行记录仪（常驻 ring buffer 消费）               │
 │   └─ 写侧（eBPF 干预 + LKM 原语模块加载）              │
@@ -417,18 +446,30 @@ introspect(pid, view=maps|threads|stack|fds, cursor=…, fields=[…], page=…)
 └───────────────────────────────────────────────────────┘
 ```
 
-**关键**：guest-agent 需要贴着靶机内核（挂探针、读 kcore），所以它在靶机内、**不可信**；可信的东西（审计/门/仲裁）全在宿主。AI 即便完全接管 guest-agent，也改不了已 ship 到宿主的审计、绕不过宿主的门。
+**关键**：guest-agent 需要贴着靶机内核（挂探针、读 kcore），所以它在靶机内、**不可信**；MCP、授权、意图审计、预算、门和仲裁全部在宿主。正常 Fovea 请求绕不过宿主入口；若 guest 或 guest kernel 完全失陷，宿主保证的是 containment、停止/回滚和宿主账完整，不保证靶机内部仍遵守协议。
 
-### 13.3 组件分解 + 可靠性梯度
+### 13.3 代码层次 + 可靠性梯度
 
-把组件按「可靠性要求」分两个平面，梯度直接映射到「谁在信任边界哪一侧」：
+**逻辑上分六层，物理上暂不要求一层一个 crate。** 层是依赖规则；crate 只在跨信任边界、共享合同或独立部署确有价值时拆：
 
-| 平面 | 组件 | 可靠性要求 | 位置 |
+| 层 | 内容 | 依赖约束 |
+|---|---|---|
+| **L1 合同层** | Level0/Level1、Request/Response、handle、错误和副作用枚举 | 纯数据，无 `/proc`、tokio、MCP、QMP、blazesym、libbpf |
+| **L2 领域层** | 投影、置信度、成本估算、授权决策、状态机 | 只依赖 L1 和抽象 port，不做 I/O |
+| **L3 用例层** | introspect、attach/detach、fs transaction、dispatch pipeline | 编排领域对象；不得直接 syscall |
+| **L4 Port 层** | `ProcSource`、`SymbolizerClient`、`AuditSink`、`HumanGate`、`GuestTransport`、`SnapshotController` | trait 只表达能力合同 |
+| **L5 Adapter 层** | Linux `/proc`、blazesym worker、libbpf、virtio-vsock、JSONL audit、QMP、MCP | 所有平台和第三方依赖停在这里 |
+| **L6 Bootstrap 层** | 两个 bin 的配置、依赖装配、tracing、shutdown | 只组装，不放业务规则 |
+
+部署时再分三个平面：
+
+| 平面 | 组件 | 可信度 / 可靠性 | 位置 |
 |---|---|---|---|
-| **控制面** | 审计 sink、人审门、仲裁器、probe manager、VM 快照 | 极高（不能是崩的那个） | 审计/门/仲裁/快照在宿主；probe manager 在靶机但逻辑简单可测 |
-| **数据面** | 内省引擎、飞行记录仪、写侧执行 | best-effort（高量、可能撒谎） | 靶机 |
+| **可信控制面** | MCP、授权、预算、意图审计、仲裁、人审门、VM 快照 | 极高，可穷尽测试 | 宿主 |
+| **特权执行面** | vsock executor、probe manager、符号化 worker、写侧执行 | 高权限但不可信，失败要可停止 | 靶机 |
+| **观测数据面** | `/proc` 内省、飞行记录仪、效果 telemetry | best-effort、高量、可能撒谎 | 靶机 |
 
-> 设计原则：**控制面小、简单、可穷尽测试；数据面高量、best-effort、带置信度**。别让数据面的复杂度渗进控制面。
+> 设计原则：**可信控制面小、简单、可穷尽测试；特权执行面最小化；观测数据面高量、best-effort、带置信度。** 内层不得反向 import MCP、QMP、blazesym 或 libbpf。
 
 ### 13.4 `introspect` 具体 schema
 
@@ -442,17 +483,18 @@ introspect(pid, view=maps|threads|stack|fds, cursor=…, fields=[…], page=…)
         { owner=AI, ts, purpose, class=观测|干预, affects=[syscall/fn...] }
 拆除：  probe manager 能按 owner=AI 枚举所有 pin，原子 detach + unpin
         ← 这就是「人赢」的干净拆除；人一键收回 AI 全部内核挂载
-审计：  每次 attach/detach/config → 意图审计一条(ship 到宿主 sink)
+审计：  host 在下发 attach/detach/config 前写意图；guest 回执行回执和效果 telemetry
 可发现：干预类(class=干预)的 affects 字段，喂给人 shell 的「当前干预查询」(§8.3)
 ```
 
 **干预类必须在 registry 里显式标 `affects`**，否则 §8.3 的「查当前 N 个干预影响哪个 syscall」无从实现。
 
-### 13.6 宿主侧审计 sink（vsock）
+### 13.6 宿主侧审计与 vsock 回执
 
 - **append-only**，格式 JSON lines（可 grep 可投影，符合全篇 token 友好基调）或二进制日志 + 索引。
-- guest-agent 把审计事件**经 vsock ship 到 host-supervisor**——不走靶机网络、不落靶机磁盘（AI 都能碰），已 ship 的宿主侧记录 AI 改不了（§8.1）。
-- **两流分开**：意图流（每个决策，完整）+ 效果流（采样运行时统计）。别混进一个 schema。
+- **意图流由 host-supervisor 在 dispatch 前生成并 append**：记录请求、派生出的副作用等级、预算、gate decision 和最终是否下发。这是 Fovea 控制路径的权威账。
+- guest-agent 经 vsock 回传**执行回执**和**效果流**；不走靶机网络、不落靶机磁盘，但其内容仍来自不可信侧，只能作为证据，不能覆盖或修订宿主意图账。
+- **三流分开**：意图流（宿主权威）+ 执行回执（靶机声明）+ 效果流（采样运行时统计）。别混进一个 schema。
 
 ### 13.7 VM 靶机搭建
 
@@ -471,6 +513,7 @@ qemu-system-x86_64 \
 
 ### 13.8 MCP 能力面映射
 
+- MCP server **只在 host-supervisor**。guest-agent 暴露的是内部、不可被 AI 直接调用的 vsock executor。
 - 每个具名 verb（`fs.find`、`proc.introspect`…）= 一个 MCP tool + JSON schema。
 - 逃生舱 exec = 一个 MCP tool，输出强制结构化包装（stdout/stderr/exit/耗时/会话状态 delta）。
 - **自描述** = 一个 MCP tool 吐全能力目录 + 每个 verb 的**副作用等级**一等字段：
@@ -485,6 +528,19 @@ qemu-system-x86_64 \
 
 - 会话状态（cd/env/后台 job）= 显式、可查询、可持久化的对象（§2.2），不是隐式进程状态。
 
+请求固定走以下 pipeline，任何 adapter 不得绕过：
+
+```
+MCP decode/validate
+  → host 根据 Request variant 派生 side_effect
+  → 预算检查 / gate / 仲裁
+  → host append 意图审计
+  → vsock dispatch
+  → guest execute
+  → response + execution receipt + effect telemetry
+  → host 返回结构化 MCP 结果
+```
+
 ### 13.9 构建顺序 / 里程碑（安全脚手架**先于**写能力）
 
 > 排序原则：**先便宜地证明形态，后置昂贵/危险的；安全脚手架必须早于任何写能力**——绝不让写能力先于它的容器存在。
@@ -493,10 +549,10 @@ qemu-system-x86_64 \
 |---|---|---|
 | **M0** | VM harness：宿主+靶机、vsock 通道、savevm/loadvm、gdb stub 全通；实测 `kvm_intel.pt_mode` | 基座能跑、能秒回滚、能调内核（还没 AI） |
 | **M1** | 只读 `introspect(pid)` Level 0：`/proc` + blazesym，零探针 | **投影**成立（GB maps → 十几行）——皇冠明珠第一刀 |
-| **M2** | MCP front：把 M1 包成 MCP tool，结构化输出 + 自描述目录 | AI 能调 introspect；能力面形态成立 |
+| **M2** | 宿主侧 MCP front：把 M1 包成 MCP tool，加入副作用派生、最小意图记录和自描述目录 | AI 只能经可信入口调 introspect；能力面形态成立 |
 | **M3** | introspect Level 1 views + cost_hint + 置信度 | 投影/分页/成本可调度（§2.1 编排器有料可调） |
 | **M4** | 飞行记录仪：常驻 ring buffer，极低扰动 | 瞬态事件抓得到（§7.2） |
-| **M5** | **宿主侧审计 sink（意图审计）+ 仲裁器（人优先 + flush 拆除）+ 干预门 hook（拦干预类 attach，默认放行、可切人审）** | **安全脚手架就位（含事前门）——在任何写能力之前** |
+| **M5** | **宿主侧 durable append-only 审计 sink + 仲裁器（人优先 + flush 拆除）+ 干预门 hook（拦干预类 attach，默认放行、可切人审）** | **安全脚手架就位（含事前门）——在任何写能力之前** |
 | **M6** | eBPF 观测通道：按需挂探针 + 效果审计 | 读侧完整（观测类，只读，视图按需） |
 | **M7** | eBPF 干预通道（override/丢包）+ **被动可发现** | 第一个写能力，verifier 兜底，带 §8.3 可发现 |
 | **M8** | fs 事务：dry-run diff + 定点回滚 | fs 写可预览可撤（§9 事务层） |
@@ -510,13 +566,13 @@ qemu-system-x86_64 \
 
 ## 14. 设计公理
 
-1. 玻璃盒坐在 Unix 上，人机双通道，不是新内核。
+1. Linux 是机制内核，Fovea 是 AI 控制内核；不重写调度、内存管理、驱动和 ABI。
 2. 具名 verb 占比 = AI-native 刻度。
 3. eBPF = 不可靠 operator 的内核态安全信封；LKM 走人审门。
 4. AI 定策略、eBPF 执行；AI 不在快路径环路。
 5. 默认零探针 + 低扰动飞行记录仪。
 6. overhead 可解、heisenbug 只能压。
-7. VM 边界 = 信任边界；一切可信控制面（审计/门/仲裁）坐宿主侧，门只管加载、管不了运行时。
+7. VM 边界 = 信任边界；MCP 外部入口和一切可信控制面（授权/预算/审计/门/仲裁）坐宿主侧。
 8. 人永远优先，但「优先」的牙 = 干净拆除 + 分层回滚；对已 commit 副作用，阻止继续 ≠ 回溯撤销。
 9. 玻璃盒对人默认半透明，靠「意图审计恒开 + 干预类被动可发现 + 一键拆除」修回准透明。
 10. LKM 侧信任边界在参数不在代码：审参数 ≫ 审生成的 C。
@@ -525,6 +581,8 @@ qemu-system-x86_64 \
 13. 安全脚手架永远先于写能力落地（M5 先于 M6+）；绝不让写能力 predate 它的容器——**容器含事前门 hook（默认放行、可切人审），不只事后审计/拆除**。
 14. verifier ≠ 授权门：它证明「不崩」，不证明「该做」；干预类写能力的事前控制 = verifier（挡崩溃）+ 人审门（挡语义/授权）两道，缺一不可。
 15. 静默污染分读写两侧：读侧靠置信度可缓解，**写侧（干预探针语义幻觉）部分可缓解、不可根治**，别当已解决。
+16. 意图审计由宿主在 dispatch 前生成；guest 的 response/receipt/effect 皆来自不可信侧，不得冒充地面真值。
+17. seL4/Genode/Zircon/QNX/Asterinas/Unikraft/CHERI 是设计参考，不是运行基座；新增抽象必须最终映射回 Linux 机制。
 
 ---
 
@@ -549,6 +607,14 @@ qemu-system-x86_64 \
 - [x] §11 静默污染档位 = 研究机 ②+③ 打底、① 只给 wchan（够）
 - [x] **运行平台 = VM 靶机，一开始就跑 VM**（M0 起在 QEMU/KVM 靶机上；宿主 KVM/内存/guest-PT 可用性 M0 内实测；裸机仅作 Intel PT / heisenbug 最终验证的**可选退路**，非起步路径）
 
+**架构基线增补（2026-07-23）**
+
+- [x] Linux = 机制内核；Fovea = AI 控制内核，不重写 Linux ABI/调度/内存/驱动。
+- [x] MCP front 只在 host-supervisor；guest-agent 仅暴露内部 vsock executor。
+- [x] 宿主意图审计在 dispatch 前生成；guest 只回 execution receipt / effect telemetry。
+- [x] M0 验收基线固定为 Linux x86_64 + QEMU/KVM；Apple Silicon Mac 不作为等价验收环境。
+- [x] seL4/Genode/Zircon/QNX/Asterinas/Unikraft/CHERI 只作为分层参考，见 §1.4。
+
 **已确立、可动手（无需再论证）**
 
 - [x] 信任边界坐宿主侧，daemon 拆 guest-agent + host-supervisor（§8.1/§13.2）
@@ -558,10 +624,11 @@ qemu-system-x86_64 \
 - [x] managed runtime 选 A（透到运行时边界）（§11）
 - [x] 构建顺序 M0–M9，安全脚手架 M5 先于写能力（§13.9）
 
-**下一步候选（挑一个往下抠）**
+**下一步顺序**
 
-1. **抠 M1 的 introspect Level 0 返回结构到字段级 + blazesym 集成细节**（最贴近动手，零风险高价值）；
-2. 或**抠飞行记录仪常驻底座（M4）**：采什么、ring buffer 多大、触发条件、扰动预算；
-3. 或**先把 §12 两个待确认拍死**，再定 introspect 里 cost_hint 账本怎么记。
+1. **先收口 M1**：修正 `/proc/status` 的 ctxt-switch 接线、UTF-8 安全截断、符号化失败置信度，并让 Mac 单测与 Linux CI 同时跑绿。
+2. **完成 M0**：在 Linux x86_64 KVM 宿主打通 QMP 快照、gdb、virtio-vsock 和 guest PT 探测。
+3. **完成 M2**：宿主 MCP ingress + side-effect 派生 + dispatch 前意图审计；guest 只接内部请求。
+4. 再抠 **M4 飞行记录仪**：采样内容、ring buffer 大小、触发条件和扰动预算。
 
-> 倾向：先 1。introspect Level 0 是 M1、是皇冠明珠第一刀、纯只读零风险，抠到字段级就能开写。
+> 顺序理由：先让只读投影可信且可编译，再固定物理信任边界，随后开放 AI 入口；不要在三者之前设计写能力。
