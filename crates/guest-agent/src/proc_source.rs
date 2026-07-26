@@ -403,26 +403,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cpu_pair_reads_process_then_system_without_intervening_reads() {
+    fn initial_and_final_cpu_pairs_read_process_then_system_adjacently() {
         let reads = RefCell::new(Vec::new());
 
-        let pair = read_adjacent_cpu_pair(
+        let initial = read_adjacent_cpu_pair(
             || {
-                reads.borrow_mut().push("process");
+                reads.borrow_mut().push("initial_process");
                 Ok::<_, ProcError>(10)
             },
             || {
-                reads.borrow_mut().push("system");
+                reads.borrow_mut().push("initial_system");
                 Ok::<_, ProcError>(20)
             },
         )
         .unwrap();
         reads.borrow_mut().push("slow_snapshot_read");
+        let final_pair = read_adjacent_cpu_pair(
+            || {
+                reads.borrow_mut().push("final_process");
+                Ok::<_, ProcError>(30)
+            },
+            || {
+                reads.borrow_mut().push("final_system");
+                Ok::<_, ProcError>(40)
+            },
+        )
+        .unwrap();
 
-        assert_eq!(pair, (10, 20));
+        assert_eq!(initial, (10, 20));
+        assert_eq!(final_pair, (30, 40));
         assert_eq!(
             reads.into_inner(),
-            ["process", "system", "slow_snapshot_read"]
+            [
+                "initial_process",
+                "initial_system",
+                "slow_snapshot_read",
+                "final_process",
+                "final_system",
+            ]
         );
     }
 
@@ -440,20 +458,31 @@ mod tests {
     }
 
     #[test]
-    fn process_io_keeps_unrelated_errors_non_disappearance() {
-        let unrelated = Error::new(ErrorKind::Other, "unrelated");
-        assert_eq!(
-            classify_proc_io(&unrelated, ProcIoScope::Process),
-            ProcIoErrorClass::Other
-        );
+    fn process_io_keeps_global_and_unrelated_errors_distinct_from_disappearance() {
+        for (error, expected) in [
+            (
+                Error::new(ErrorKind::PermissionDenied, "denied"),
+                ProcIoErrorClass::Permission,
+            ),
+            (
+                Error::new(ErrorKind::InvalidData, "invalid"),
+                ProcIoErrorClass::InvalidData,
+            ),
+            (
+                Error::new(ErrorKind::Other, "unrelated"),
+                ProcIoErrorClass::Other,
+            ),
+        ] {
+            assert_eq!(classify_proc_io(&error, ProcIoScope::Process), expected);
+        }
 
         for error in [
             Error::new(ErrorKind::NotFound, "global path missing"),
             Error::from_raw_os_error(ESRCH_RAW_OS_ERROR),
         ] {
-            assert_ne!(
+            assert_eq!(
                 classify_proc_io(&error, ProcIoScope::Global),
-                ProcIoErrorClass::ProcNotFound
+                ProcIoErrorClass::Other
             );
         }
     }
