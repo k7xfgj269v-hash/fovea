@@ -32,6 +32,8 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 # 唯一 id
 uuid = { version = "1", features = ["v4", "serde"] }
+# Linux adapter uses the public sysconf ABI for runtime page size.
+libc = "0.2"
 
 # workspace 内部依赖走 path
 vsock = { path = "crates/vsock" }
