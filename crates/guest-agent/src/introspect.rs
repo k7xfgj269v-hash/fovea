@@ -160,8 +160,8 @@ pub fn introspect_with_inputs(
         // %cpu 短采样还没落地——M1 第二刀保守给 0.0，TODO 标 M1.5。
         pct_cpu: 0.0,
         ctxt_switches: introspect_schema::CtxtSwitches {
-            voluntary: stat.voluntary_ctxt,
-            nonvoluntary: stat.nonvoluntary_ctxt,
+            voluntary: status.voluntary_ctxt_switches,
+            nonvoluntary: status.nonvoluntary_ctxt_switches,
         },
     };
 
@@ -173,9 +173,8 @@ pub fn introspect_with_inputs(
 
     // ─── confidence (§11 ① 双路交叉验证) ──────────────────────────
     // §11 ① 双路交叉验证：wchan 符号化结果 vs /proc/<pid>/stack 顶帧是否自洽。
-    // 本刀：wchan 存在 + D 态有 kernel stack → 调 Symbolizer::cross_check；
-    // 否则 confidence 整体偏保守。
-    let confidence = build_confidence(&wchan_raw, &kernel_stack, sym);
+    // completed hotspot 同时提供逐帧符号置信度和交叉校验所需的顶帧。
+    let confidence = build_confidence(&wchan_raw, &hotspot, sym);
 
     // ─── handles (§10 全 None, M3 才给可消费 cursor) ──────────────
     let handles = Handles::default();
@@ -205,18 +204,19 @@ pub fn introspect_with_inputs(
 /// 把 /proc/<pid>/cmdline 的 \0 分隔字节拼成 [`Cmdline`]。
 fn build_cmdline(bytes: &[u8]) -> introspect_schema::Cmdline {
     // /proc/<pid>/cmdline 用 \0 分隔多个 argv 元素。
-    // 本刀简化：把 \0 替换成空格, 然后截到 CMDLINE_SHORT_MAX。
-    let mut joined = String::from_utf8_lossy(bytes)
+    // 本刀简化：把 \0 替换成空格, 然后按 Unicode scalar 截到 CMDLINE_SHORT_MAX。
+    let joined = String::from_utf8_lossy(bytes)
         .replace('\u{0}', " ")
         .trim()
         .to_string();
     let full_len = joined.len();
-    if joined.len() > CMDLINE_SHORT_MAX {
-        joined.truncate(CMDLINE_SHORT_MAX);
-        joined.push('…');
+    let mut chars = joined.chars();
+    let mut short: String = chars.by_ref().take(CMDLINE_SHORT_MAX).collect();
+    if chars.next().is_some() {
+        short.push('…');
     }
     introspect_schema::Cmdline {
-        short: joined,
+        short,
         full_len,
     }
 }
@@ -262,18 +262,40 @@ fn build_hotspot(
 /// §11 ③：置信度是一等输出——本函数是「它告诉你它有多不确定」的代码归宿。
 fn build_confidence(
     wchan_raw: &Option<String>,
-    kernel_stack: &[(String, String)],
+    hotspot: &Hotspot,
     sym: &dyn Symbolizer,
 ) -> ConfidenceSummary {
     let mut low_fields: Vec<LowConfidenceField> = Vec::new();
+    let mut symbol_scores = Vec::new();
+
+    if let Hotspot::Blocked { frames } = hotspot {
+        for frame in frames {
+            let confidence = match (&frame.symbol, frame.confidence) {
+                (Some(_), Some(confidence)) => confidence,
+                _ => SymbolConfidence::None,
+            };
+            symbol_scores.push(confidence.score());
+            if confidence == SymbolConfidence::None {
+                low_fields.push(LowConfidenceField {
+                    path: format!("hotspot.frames[{}].symbol", frame.idx),
+                    confidence: Some(SymbolConfidence::None),
+                    reason: "blocked frame symbolization failed or produced no confidence".into(),
+                });
+            }
+        }
+    }
 
     // ① wchan vs 顶帧自洽性
-    if let (Some(wchan_name), Some((top_addr_s, top_sym_raw))) = (
-        wchan_raw,
-        kernel_stack.first(),
-    ) {
-        let top_addr = u64::from_str_radix(top_addr_s.trim_start_matches("0x"), 16).unwrap_or(0);
+    let mut cross_check_failed = false;
+    let top_frame = match hotspot {
+        Hotspot::Blocked { frames } => frames.first(),
+        Hotspot::NotBlocked => None,
+    };
+    if let (Some(wchan_name), Some(top_frame)) = (wchan_raw, top_frame) {
+        let top_addr =
+            u64::from_str_radix(top_frame.addr.trim_start_matches("0x"), 16).unwrap_or(0);
         if let Some(reason) = sym.cross_check(top_addr, wchan_name) {
+            cross_check_failed = true;
             low_fields.push(LowConfidenceField {
                 path: "state.wchan".into(),
                 confidence: Some(SymbolConfidence::Kallsyms),
@@ -284,19 +306,19 @@ fn build_confidence(
                 confidence: Some(SymbolConfidence::Kallsyms),
                 reason: "wchan/顶帧不自洽：wchan 是可信嫌疑方之一".into(),
             });
-            let _ = top_sym_raw;
         }
     }
 
-    // ② wchan 本身缺失（R/S/Z 态正常，D 态下没有 wchan 是病）
-    if wchan_raw.is_none() {
-        // 不强行降权——§10 wchan 是 D 态诊断银弹，但其它态没有 wchan 是常态。
-        // 这里只做不告警的占位。
+    // ② 整体 overall：已观测帧的符号置信度算术平均；无符号观测时为 1.0。
+    // wchan/顶帧交叉校验失败时，即使单帧符号本身很强，整体也不得高于 0.5。
+    let mut overall = if symbol_scores.is_empty() {
+        1.0
+    } else {
+        symbol_scores.iter().sum::<f32>() / symbol_scores.len() as f32
+    };
+    if cross_check_failed {
+        overall = overall.min(0.5);
     }
-
-    // ③ 整体 overall：§11 「它会告诉你它有多不确定」——
-    //   默认 1.0（全自洽 + 全符号化），每个 low_field 扣一档线性降权。
-    let overall = (1.0_f32 - 0.15 * low_fields.len() as f32).max(0.0);
 
     ConfidenceSummary {
         overall,
@@ -321,6 +343,7 @@ fn map_io_err(e: std::io::Error, pid: i32) -> ProcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::symbolize::{make_symbolized, SymbolizeError};
     use introspect_schema::MapKind;
 
     /// 引擎在 Mac 上跑 introspect() —— cfg-gate 直接走 NotImplemented，
@@ -341,20 +364,21 @@ mod tests {
     #[test]
     fn introspect_with_inputs_builds_level0() {
         // 真 /proc/<pid>/stat 是一行。idx 严格按 man proc（state=0/nr_threads=17/
-        // vsize=20/rss=21/last_cpu=36/voluntary=37/nonvoluntary=38），其余 0 占位。
-        let tail_39: Vec<&str> = (0..39)
-            .map(|i| match i {
-                17 => "7",
-                20 => "4000000",
-                21 => "1000000",
-                36 => "9",
-                37 => "3",
-                38 => "17",
-                _ => "0",
-            })
-            .collect();
-        let stat = format!("42 (demo) D {}\n", tail_39.join(" "));
-        let status = "Name:\tdemo\nUid:\t1000\t1000\t1000\t1000\nFDSize:\t64\n";
+        // vsize=20/rss=21/last_cpu=36）；37/38 是 rt_priority/policy，不是 ctxt。
+        let mut stat_fields = vec!["0"; 39];
+        stat_fields[0] = "D";
+        stat_fields[17] = "7";
+        stat_fields[20] = "4000000";
+        stat_fields[21] = "100000";
+        stat_fields[36] = "9";
+        stat_fields[37] = "900";
+        stat_fields[38] = "901";
+        let stat = format!("42 (demo) {}\n", stat_fields.join(" "));
+        let status = "Name:\tdemo\n\
+                      Uid:\t1000\t1000\t1000\t1000\n\
+                      FDSize:\t64\n\
+                      voluntary_ctxt_switches:\t3\n\
+                      nonvoluntary_ctxt_switches:\t17\n";
         let maps = "\
 7f0000000000-7f0000100000 rw-p 00000000 00:00 0                          [heap]\n\
 7ffe00000000-7ffe00004000 rw-p 00000000 00:00 0                          [stack]\n\
@@ -417,6 +441,102 @@ mod tests {
         assert_eq!(l0.cost_hint.token, 500);
         assert!(l0.cost_hint.api_cost.is_none());
         assert_eq!(l0.cost_hint.overhead_est_ns, 0);
+    }
+
+    #[test]
+    fn cmdline_truncates_at_unicode_scalar_boundaries() {
+        let at_255 = "a".repeat(255);
+        let at_256 = "b".repeat(256);
+        let at_257 = "c".repeat(257);
+
+        assert_eq!(build_cmdline(at_255.as_bytes()).short, at_255);
+        assert_eq!(build_cmdline(at_256.as_bytes()).short, at_256);
+
+        let truncated = build_cmdline(at_257.as_bytes());
+        assert_eq!(truncated.short.chars().count(), 257);
+        assert!(truncated.short.ends_with('…'));
+        assert_eq!(truncated.full_len, 257);
+    }
+
+    #[test]
+    fn cmdline_multibyte_character_crossing_byte_256_stays_valid_utf8() {
+        let joined = format!("{}éz", "a".repeat(255));
+        let cmdline = build_cmdline(joined.as_bytes());
+
+        assert_eq!(cmdline.full_len, 258);
+        assert_eq!(cmdline.short.chars().count(), 257);
+        assert!(cmdline.short.ends_with("é…"));
+    }
+
+    struct SuccessfulSymbolizer;
+
+    impl Symbolizer for SuccessfulSymbolizer {
+        fn symbolize(&self, addr: u64) -> Result<Symbolized, SymbolizeError> {
+            let confidence = if addr == 1 {
+                SymbolConfidence::Dwarf
+            } else {
+                SymbolConfidence::Kallsyms
+            };
+            Ok(make_symbolized(format!("frame_{addr}"), confidence))
+        }
+    }
+
+    #[test]
+    fn confidence_averages_successful_frame_symbols() {
+        let stack = vec![
+            ("1".to_string(), "frame_1".to_string()),
+            ("2".to_string(), "frame_2".to_string()),
+        ];
+        let sym = SuccessfulSymbolizer;
+        let hotspot = build_hotspot(RunState::D, &stack, &sym);
+        let confidence = build_confidence(&None, &hotspot, &sym);
+
+        assert!((confidence.overall - 0.875).abs() < f32::EPSILON);
+        assert!(confidence.low_fields.is_empty());
+    }
+
+    #[test]
+    fn failed_blocked_frame_symbols_lower_overall_confidence() {
+        let stack = vec![
+            ("1".to_string(), "frame_1".to_string()),
+            ("2".to_string(), "frame_2".to_string()),
+        ];
+        let sym = FallbackSymbolizer;
+        let hotspot = build_hotspot(RunState::D, &stack, &sym);
+        let confidence = build_confidence(&None, &hotspot, &sym);
+
+        assert_eq!(confidence.overall, 0.0);
+        assert_eq!(confidence.low_fields.len(), 2);
+        for (idx, field) in confidence.low_fields.iter().enumerate() {
+            assert_eq!(field.path, format!("hotspot.frames[{idx}].symbol"));
+            assert_eq!(field.confidence, Some(SymbolConfidence::None));
+        }
+    }
+
+    struct CrossCheckFailureSymbolizer;
+
+    impl Symbolizer for CrossCheckFailureSymbolizer {
+        fn symbolize(&self, _addr: u64) -> Result<Symbolized, SymbolizeError> {
+            Ok(make_symbolized("frame", SymbolConfidence::Dwarf))
+        }
+
+        fn cross_check(&self, _addr: u64, _expected_top_frame: &str) -> Option<String> {
+            Some("wchan/top frame mismatch".into())
+        }
+    }
+
+    #[test]
+    fn failed_cross_check_caps_overall_confidence() {
+        let stack = vec![("1".to_string(), "frame".to_string())];
+        let sym = CrossCheckFailureSymbolizer;
+        let hotspot = build_hotspot(RunState::D, &stack, &sym);
+        let confidence = build_confidence(&Some("wchan".into()), &hotspot, &sym);
+
+        assert_eq!(confidence.overall, 0.5);
+        assert!(confidence
+            .low_fields
+            .iter()
+            .any(|field| field.path == "state.wchan"));
     }
 
     /// ProcError::to_error_report 三元组形状——跨 vsock 兜底契约。
