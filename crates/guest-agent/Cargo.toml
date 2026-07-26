@@ -22,6 +22,9 @@ introspect-schema.workspace = true
 # Mac 上 `default-features=false` pure-Rust 编译通过、零系统库依赖。
 blazesym = { version = "0.2", default-features = false, features = ["dwarf", "demangle"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [lib]
 name = "guest_agent"
 path = "src/lib.rs"

@@ -5,72 +5,12 @@
 //! 对目标进程连观察者效应都没有（§13.4）。
 //!
 //! 本模块专门负责解析层；不在本模块做符号化（符号化是 [`crate::symbolize`] 的事），
-//! 不在本模块组合出完整 [`Level0`]（那是 [`super::engine`] 的事）。单一职责让 /proc
-//! 读取逻辑可单测、不依赖 blazesym、不依赖 vsock——所以可以在 Mac 上跑测试。
-
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
+//! 不在本模块组合完整 Level 0（那是 [`crate::introspect`] 的事）。Linux 文件 I/O
+//! 全部留在 [`crate::proc_source`]，因此解析测试可以在 Mac 上运行。
 
 use introspect_schema::{MapKind, MemShape, MapKindBucket, RunState, TopMap};
 
-/// /proc 解析层失败模式。结构化（§2.2），不是 IOException 散文。
-///
-/// serde 约束：本 enum 是 `#[serde(tag = "kind")]` 内部标签枚举。
-/// 内部标签只接受 unit / struct / newtype-包-map 变体；newtype-包-i32
-/// 能编过但运行时 `serde_json::to_string` 会返 Err（"cannot serialize
-/// tagged newtype variant containing an integer"）。`ProcNotFound` 是
-/// introspect 最常见错误路径（pid 没了）——偏偏在最该报错时序列化失败
-/// 是最糟的失效模式，所以用 struct 变体保安全。
-#[derive(Debug, Error, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ProcError {
-    #[error("pid {pid} 不存在")]
-    ProcNotFound { pid: i32 },
-    #[error("读 /proc 权限不足")]
-    Permission,
-    #[error("解析 {what} 失败：{reason}")]
-    Parse { what: String, reason: String },
-    /// M1 第一刀之后、第二刀之前的占位状态——壳在位、实现待填。
-    /// 见 [`crate::engine::introspect`]
-    #[error("尚未实现（M1 第二刀）")]
-    NotImplemented,
-}
-
-/// ProcError → 跨 vsock 的 `ErrorReport` 三元组（§2.2 结构化错误）。
-///
-/// 返 (kind, reason, next_step)，让真正跨边界的调用方（M2 MCP server
-/// 或 transport 层）自己包成 vsock::model::ErrorReport——本 crate 不
-/// 依赖 vsock（schema/vsock 是叶子、guest-agent 不向下 dep vsock 避免
-/// 循环）。
-///
-/// kind 串走 snake_case，匹配 vsock::model::ErrorReport doc 的样例
-/// （proc_not_found / proc_parse_failed）。
-impl ProcError {
-    pub fn to_error_report(&self) -> (&'static str, String, Option<&'static str>) {
-        match self {
-            ProcError::ProcNotFound { pid } => (
-                "proc_not_found",
-                format!("pid {pid} 不存在或已退出"),
-                Some("重试前用 introspect(pid=1) 或类似探活；确认 pid 仍存活"),
-            ),
-            ProcError::Permission => (
-                "proc_permission_denied",
-                "读 /proc/<pid>/ 权限不足".into(),
-                Some("guest-agent 需挂足够权限（root 或 CAP_SYS_PTRACE 等）"),
-            ),
-            ProcError::Parse { what, reason } => (
-                "proc_parse_failed",
-                format!("解析 {what} 失败：{reason}"),
-                Some("大概率是 /proc 行格式漂移；对齐到目标内核版本"),
-            ),
-            ProcError::NotImplemented => (
-                "not_implemented",
-                "introspect 该路径尚未在当前 milestone 实现".into(),
-                None,
-            ),
-        }
-    }
-}
+pub use crate::proc_source::ProcError;
 
 // ─── /proc/<pid>/stat 的裸解析产物 ─────────────────────────────────────────────
 
@@ -88,6 +28,8 @@ pub struct Stat {
     pub nr_threads: u32,
     pub vsize: u64,
     pub rss: u64,
+    /// stat 字段 14 + 15：进程用户态和内核态累计 ticks。
+    pub process_ticks: u64,
     /// stat 第 39 字段：last CPU。
     pub last_cpu: u32,
     // ⚠️ ctxt_switches **不**从 stat 取。man proc 字段 40 = `rt_priority`、
@@ -173,6 +115,12 @@ pub fn parse_stat(content: &str) -> Result<Stat, ProcError> {
     let ppid: i32 = need(1, "ppid")?
         .parse()
         .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.ppid".into(), reason: e.to_string() })?;
+    let utime: u64 = need(11, "utime")?
+        .parse()
+        .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.utime".into(), reason: e.to_string() })?;
+    let stime: u64 = need(12, "stime")?
+        .parse()
+        .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.stime".into(), reason: e.to_string() })?;
     // 字段 20=nr_threads => idx 17 (20-3)。
     let nr_threads: u32 = need(17, "nr_threads")?
         .parse()
@@ -201,8 +149,102 @@ pub fn parse_stat(content: &str) -> Result<Stat, ProcError> {
         nr_threads,
         vsize,
         rss: rss_pages,
+        process_ticks: utime.saturating_add(stime),
         last_cpu,
     })
+}
+
+/// Parsed aggregate `/proc/stat` CPU counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemCpu {
+    pub ticks: u64,
+    pub logical_cpus: u32,
+}
+
+/// Parse aggregate CPU ticks and the logical CPU line count from `/proc/stat`.
+///
+/// Linux reports guest and guest_nice as time already included in user and
+/// nice, so only the first eight counters are summed to avoid double-counting.
+pub fn parse_system_cpu(content: &str) -> Result<SystemCpu, ProcError> {
+    let mut aggregate = None;
+    let mut logical_cpus: u32 = 0;
+
+    for line in content.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(name) = fields.next() else {
+            continue;
+        };
+        if name == "cpu" {
+            let values: Vec<&str> = fields.collect();
+            if values.len() < 4 {
+                return Err(ProcError::Parse {
+                    what: "proc_stat.cpu".into(),
+                    reason: "aggregate cpu 行少于 4 个计数器".into(),
+                });
+            }
+            let mut ticks = 0u64;
+            for value in values.into_iter().take(8) {
+                let value = value.parse::<u64>().map_err(
+                    |error: std::num::ParseIntError| ProcError::Parse {
+                        what: "proc_stat.cpu".into(),
+                        reason: error.to_string(),
+                    },
+                )?;
+                ticks = ticks.checked_add(value).ok_or_else(|| ProcError::Parse {
+                    what: "proc_stat.cpu".into(),
+                    reason: "aggregate cpu ticks 溢出 u64".into(),
+                })?;
+            }
+            aggregate = Some(ticks);
+        } else if let Some(index) = name.strip_prefix("cpu") {
+            if !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()) {
+                logical_cpus = logical_cpus.checked_add(1).ok_or_else(|| ProcError::Parse {
+                    what: "proc_stat.logical_cpus".into(),
+                    reason: "logical CPU 数溢出 u32".into(),
+                })?;
+            }
+        }
+    }
+
+    let ticks = aggregate.ok_or_else(|| ProcError::Parse {
+        what: "proc_stat.cpu".into(),
+        reason: "缺 aggregate cpu 行".into(),
+    })?;
+    if logical_cpus == 0 {
+        return Err(ProcError::Parse {
+            what: "proc_stat.logical_cpus".into(),
+            reason: "没有 cpuN 行".into(),
+        });
+    }
+
+    Ok(SystemCpu {
+        ticks,
+        logical_cpus,
+    })
+}
+
+/// Parse the first cgroup path from `/proc/<pid>/cgroup`.
+pub fn parse_cgroup(content: &str) -> Result<Option<String>, ProcError> {
+    let Some(line) = content.lines().find(|line| !line.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let mut fields = line.splitn(3, ':');
+    let _hierarchy = fields.next();
+    let _controllers = fields.next().ok_or_else(|| ProcError::Parse {
+        what: "cgroup".into(),
+        reason: "缺 controllers 字段".into(),
+    })?;
+    let path = fields.next().ok_or_else(|| ProcError::Parse {
+        what: "cgroup".into(),
+        reason: "缺 path 字段".into(),
+    })?;
+    if path.is_empty() {
+        return Err(ProcError::Parse {
+            what: "cgroup".into(),
+            reason: "path 为空".into(),
+        });
+    }
+    Ok(Some(path.to_string()))
 }
 
 fn parse_run_state(s: &str) -> Result<RunState, ProcError> {
@@ -424,10 +466,8 @@ pub fn classify_map_kind(perms: &str, path: Option<&str>) -> Option<MapKind> {
 
 // ─── §13.4 scan_fds / read_wchan / read_kernel_stack ────────────────────────
 //
-// 这三个不走 fixture 字符串——它们内里要么读 dir 要么读文件。
-// 但因为本刀要在 Mac 上单测，引擎层（engine::introspect）也只在 Linux
-// 真跑，我们把这层 API 拆成「输入是原始字节、对字节做解析/计数」的纯函数，
-// 和「把 /proc 路径读出来再交给纯函数」的 I/O 层分开：
+// 这层 API 只接收 adapter 已读取的内容：目录项名、wchan 文本和 stack 文本。
+// LinuxProcSource 负责路径与 I/O，本模块只做可跨平台测试的解析/计数：
 //
 //   - `scan_fds_from_names(&[String]) -> u32` —— 纯函数，输入 /proc/<pid>/fd
 //     的目录项名（"0","1","2","3", ...），按规则去 "." ".." 后计数，返 fd 数。
@@ -437,8 +477,7 @@ pub fn classify_map_kind(perms: &str, path: Option<&str>) -> Option<MapKind> {
 //     按行格式 `[<hex_addr>] func_name+0xoffset/0xsize`，解析出 (addr, sym) 帧
 //     列表；纯函数。
 //
-// 真正做文件 / 目录 I/O 的薄壳函数（`read_stat_file`、`scan_fds_dir` 等）
-// 留到 M0 进靶机后一次性 cfg-gate 落到 Linux——本刀不落任何 fs::read。
+// 真正的文件 / 目录 I/O 只在 `proc_source::LinuxProcSource`。
 
 /// /proc/<pid>/fd 的目录项名列表 → fd 数。
 ///
@@ -513,9 +552,6 @@ pub fn read_kernel_stack_from_str(content: &str) -> Vec<(String, String)> {
     out
 }
 
-// TODO(M0 进靶机后)：落的薄壳函数 fs::read_to_string(..) 桥接 /proc 真路径
-// 到上面的纯函数。Mac 上不写——纯函数够 fixture 单测。
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,6 +567,10 @@ mod tests {
         let cases: Vec<ProcError> = vec![
             ProcError::ProcNotFound { pid: 42 },
             ProcError::Permission,
+            ProcError::Read {
+                what: "/proc/stat".into(),
+                reason: "unavailable".into(),
+            },
             ProcError::Parse {
                 what: "stat".into(),
                 reason: "bad number".into(),
@@ -615,13 +655,70 @@ mod tests {
         assert_eq!(r.nr_threads, 7);
         assert_eq!(r.vsize, 4_000_000);
         assert_eq!(r.rss, 100_000);
+        assert_eq!(r.process_ticks, 0);
         assert_eq!(r.last_cpu, 9);
+    }
+
+    #[test]
+    fn parse_stat_process_ticks_are_utime_plus_stime() {
+        let mut tail = vec!["0".to_string(); 39];
+        tail[0] = "S".into();
+        tail[11] = "123".into();
+        tail[12] = "77".into();
+        tail[17] = "1".into();
+        tail[20] = "4096".into();
+        tail[21] = "1".into();
+        tail[36] = "0".into();
+        let stat = format!("42 (cpu-demo) {}\n", tail.join(" "));
+
+        assert_eq!(parse_stat(&stat).unwrap().process_ticks, 200);
     }
 
     #[test]
     fn parse_stat_rejects_missing_paren() {
         let s = "42 bar S 40 42\n"; // 无 (comm) 格式
         assert!(matches!(parse_stat(s), Err(ProcError::Parse { .. })));
+    }
+
+    #[test]
+    fn parse_system_cpu_excludes_guest_ticks_and_counts_logical_cpus() {
+        let content = "cpu  10 20 30 40 50 60 70 80 900 1000\n\
+                       cpu0 1 2 3 4 5 6 7 8 9 10\n\
+                       cpu1 1 2 3 4 5 6 7 8 9 10\n\
+                       intr 123\n";
+        let parsed = parse_system_cpu(content).unwrap();
+
+        assert_eq!(parsed.ticks, 10 + 20 + 30 + 40 + 50 + 60 + 70 + 80);
+        assert_eq!(parsed.logical_cpus, 2);
+    }
+
+    #[test]
+    fn parse_system_cpu_rejects_missing_aggregate_or_logical_cpu_lines() {
+        assert!(matches!(
+            parse_system_cpu("cpu0 1 2 3 4\n"),
+            Err(ProcError::Parse { what, .. }) if what == "proc_stat.cpu"
+        ));
+        assert!(matches!(
+            parse_system_cpu("cpu 1 2 3 4\n"),
+            Err(ProcError::Parse { what, .. }) if what == "proc_stat.logical_cpus"
+        ));
+    }
+
+    #[test]
+    fn parse_cgroup_handles_v2_v1_absence_and_malformed_lines() {
+        assert_eq!(
+            parse_cgroup("0::/user.slice/demo.scope\n").unwrap(),
+            Some("/user.slice/demo.scope".into())
+        );
+        assert_eq!(
+            parse_cgroup("11:memory:/legacy/demo\n10:cpu:/legacy/demo\n").unwrap(),
+            Some("/legacy/demo".into())
+        );
+        assert_eq!(parse_cgroup("\n").unwrap(), None);
+        assert!(matches!(
+            parse_cgroup("malformed\n"),
+            Err(ProcError::Parse { what, .. }) if what == "cgroup"
+        ));
     }
 
     // ─── parse_status ──────────────────────────────────────────────────────
