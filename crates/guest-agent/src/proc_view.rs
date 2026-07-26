@@ -643,14 +643,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_status_rejects_malformed_ctxt_switch_count() {
-        let s = "Uid:\t1000\t1000\t1000\t1000\n\
-                 voluntary_ctxt_switches:\tnot-a-number\n";
-        assert!(matches!(
-            parse_status(s),
-            Err(ProcError::Parse { what, .. })
-                if what == "status.voluntary_ctxt_switches"
-        ));
+    fn parse_status_rejects_malformed_ctxt_switch_counts_structurally() {
+        for (key, expected_what) in [
+            (
+                "voluntary_ctxt_switches",
+                "status.voluntary_ctxt_switches",
+            ),
+            (
+                "nonvoluntary_ctxt_switches",
+                "status.nonvoluntary_ctxt_switches",
+            ),
+        ] {
+            let status = format!(
+                "Uid:\t1000\t1000\t1000\t1000\n{key}:\tnot-a-number\n"
+            );
+            let error = parse_status(&status).expect_err("malformed count must fail");
+
+            match &error {
+                ProcError::Parse { what, reason } => {
+                    assert_eq!(what, expected_what);
+                    assert!(!reason.is_empty());
+                }
+                other => panic!("expected structured parse error, got {other:?}"),
+            }
+
+            let (kind, reason, next_step) = error.to_error_report();
+            assert_eq!(kind, "proc_parse_failed");
+            assert!(reason.contains(expected_what));
+            assert!(next_step.is_some());
+        }
     }
 
     // ─── parse_maps（皇冠明珠投影本体回归保护） ──────────────────────────────

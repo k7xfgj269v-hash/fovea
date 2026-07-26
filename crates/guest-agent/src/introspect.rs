@@ -444,28 +444,70 @@ mod tests {
     }
 
     #[test]
-    fn cmdline_truncates_at_unicode_scalar_boundaries() {
-        let at_255 = "a".repeat(255);
-        let at_256 = "b".repeat(256);
-        let at_257 = "c".repeat(257);
+    fn resource_context_switches_ignore_stat_rt_priority_and_policy() {
+        let mut stat_fields = vec!["0"; 39];
+        stat_fields[0] = "S";
+        stat_fields[17] = "1";
+        stat_fields[20] = "4096";
+        stat_fields[21] = "1";
+        stat_fields[36] = "2";
+        stat_fields[37] = "900";
+        stat_fields[38] = "901";
+        let stat = format!("7 (scheduler-fields) {}\n", stat_fields.join(" "));
+        let status = "Uid:\t1000\t1000\t1000\t1000\n\
+                      voluntary_ctxt_switches:\t12\n\
+                      nonvoluntary_ctxt_switches:\t34\n";
+        let sym = FallbackSymbolizer;
 
-        assert_eq!(build_cmdline(at_255.as_bytes()).short, at_255);
-        assert_eq!(build_cmdline(at_256.as_bytes()).short, at_256);
+        let l0 = introspect_with_inputs(
+            7,
+            &stat,
+            status,
+            "",
+            "",
+            b"scheduler-fields\0",
+            &[],
+            "",
+            &sym,
+        )
+        .expect("valid stat and status fixtures must build Level0");
 
-        let truncated = build_cmdline(at_257.as_bytes());
-        assert_eq!(truncated.short.chars().count(), 257);
-        assert!(truncated.short.ends_with('…'));
-        assert_eq!(truncated.full_len, 257);
+        assert_eq!(l0.resource.ctxt_switches.voluntary, 12);
+        assert_eq!(l0.resource.ctxt_switches.nonvoluntary, 34);
+        assert_ne!(l0.resource.ctxt_switches.voluntary, 900);
+        assert_ne!(l0.resource.ctxt_switches.nonvoluntary, 901);
+    }
+
+    #[test]
+    fn cmdline_preserves_255_256_and_257_unicode_scalar_boundaries() {
+        for scalar_count in [255, 256, 257] {
+            let joined = "界".repeat(scalar_count);
+            let cmdline = build_cmdline(joined.as_bytes());
+            let expected_short = if scalar_count > CMDLINE_SHORT_MAX {
+                format!("{}…", "界".repeat(CMDLINE_SHORT_MAX))
+            } else {
+                joined.clone()
+            };
+
+            assert_eq!(cmdline.short, expected_short);
+            assert_eq!(cmdline.full_len, joined.len());
+            assert_eq!(
+                cmdline.short.chars().count(),
+                scalar_count.min(CMDLINE_SHORT_MAX)
+                    + usize::from(scalar_count > CMDLINE_SHORT_MAX)
+            );
+        }
     }
 
     #[test]
     fn cmdline_multibyte_character_crossing_byte_256_stays_valid_utf8() {
         let joined = format!("{}éz", "a".repeat(255));
         let cmdline = build_cmdline(joined.as_bytes());
+        let expected = format!("{}é…", "a".repeat(255));
 
         assert_eq!(cmdline.full_len, 258);
         assert_eq!(cmdline.short.chars().count(), 257);
-        assert!(cmdline.short.ends_with("é…"));
+        assert_eq!(cmdline.short, expected);
     }
 
     struct SuccessfulSymbolizer;
@@ -495,20 +537,36 @@ mod tests {
         assert!(confidence.low_fields.is_empty());
     }
 
+    struct PartiallyFailingSymbolizer;
+
+    impl Symbolizer for PartiallyFailingSymbolizer {
+        fn symbolize(&self, addr: u64) -> Result<Symbolized, SymbolizeError> {
+            if addr == 1 {
+                Ok(make_symbolized("frame_1", SymbolConfidence::Dwarf))
+            } else {
+                Err(SymbolizeError::NotFound {
+                    addr: format!("{addr:#x}"),
+                })
+            }
+        }
+    }
+
     #[test]
     fn failed_blocked_frame_symbols_lower_overall_confidence() {
         let stack = vec![
             ("1".to_string(), "frame_1".to_string()),
             ("2".to_string(), "frame_2".to_string()),
+            ("3".to_string(), "frame_3".to_string()),
         ];
-        let sym = FallbackSymbolizer;
+        let sym = PartiallyFailingSymbolizer;
         let hotspot = build_hotspot(RunState::D, &stack, &sym);
         let confidence = build_confidence(&None, &hotspot, &sym);
 
-        assert_eq!(confidence.overall, 0.0);
+        assert!((confidence.overall - (1.0 / 3.0)).abs() < f32::EPSILON);
+        assert!(confidence.overall < SymbolConfidence::Dwarf.score());
         assert_eq!(confidence.low_fields.len(), 2);
         for (idx, field) in confidence.low_fields.iter().enumerate() {
-            assert_eq!(field.path, format!("hotspot.frames[{idx}].symbol"));
+            assert_eq!(field.path, format!("hotspot.frames[{}].symbol", idx + 1));
             assert_eq!(field.confidence, Some(SymbolConfidence::None));
         }
     }
@@ -533,10 +591,12 @@ mod tests {
         let confidence = build_confidence(&Some("wchan".into()), &hotspot, &sym);
 
         assert_eq!(confidence.overall, 0.5);
-        assert!(confidence
+        let paths: Vec<_> = confidence
             .low_fields
             .iter()
-            .any(|field| field.path == "state.wchan"));
+            .map(|field| field.path.as_str())
+            .collect();
+        assert_eq!(paths, ["state.wchan", "hotspot.frames[0].symbol"]);
     }
 
     /// ProcError::to_error_report 三元组形状——跨 vsock 兜底契约。
