@@ -5,6 +5,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{
     self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError,
 };
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use thiserror::Error;
@@ -77,28 +78,161 @@ trait WorkerBackend {
     fn symbolize(&mut self, addr: u64) -> Result<Symbolized, SymbolizeError>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerState {
+    Running,
+    Executing,
+    ShutdownRequested,
+    Stopped,
+    Panicked,
+}
+
+struct WorkerLifecycle {
+    state: Mutex<WorkerState>,
+    changed: Condvar,
+}
+
+impl WorkerLifecycle {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(WorkerState::Running),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn terminal_error(&self) -> Option<SymbolizeError> {
+        match *self.state.lock().unwrap() {
+            WorkerState::Running | WorkerState::Executing => None,
+            WorkerState::ShutdownRequested | WorkerState::Stopped => {
+                Some(SymbolizeError::WorkerStopped)
+            }
+            WorkerState::Panicked => Some(SymbolizeError::WorkerPanic),
+        }
+    }
+
+    fn begin_request(&self) -> Result<(), SymbolizeError> {
+        let mut state = self.state.lock().unwrap();
+        match *state {
+            WorkerState::Running => {
+                *state = WorkerState::Executing;
+                self.changed.notify_all();
+                Ok(())
+            }
+            WorkerState::ShutdownRequested | WorkerState::Stopped => {
+                Err(SymbolizeError::WorkerStopped)
+            }
+            WorkerState::Panicked => Err(SymbolizeError::WorkerPanic),
+            WorkerState::Executing => unreachable!("worker executes one request at a time"),
+        }
+    }
+
+    fn finish_request(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        match *state {
+            WorkerState::Executing => {
+                *state = WorkerState::Running;
+                self.changed.notify_all();
+                false
+            }
+            WorkerState::ShutdownRequested
+            | WorkerState::Stopped
+            | WorkerState::Panicked => true,
+            WorkerState::Running => unreachable!("request was not marked executing"),
+        }
+    }
+
+    fn request_shutdown(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if matches!(*state, WorkerState::Running | WorkerState::Executing) {
+            *state = WorkerState::ShutdownRequested;
+            self.changed.notify_all();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn is_shutdown_requested(&self) -> bool {
+        matches!(
+            *self.state.lock().unwrap(),
+            WorkerState::ShutdownRequested | WorkerState::Stopped
+        )
+    }
+
+    fn mark_stopped(&self) {
+        let mut state = self.state.lock().unwrap();
+        if *state != WorkerState::Panicked {
+            *state = WorkerState::Stopped;
+            self.changed.notify_all();
+        }
+    }
+
+    fn mark_panicked(&self) {
+        let mut state = self.state.lock().unwrap();
+        *state = WorkerState::Panicked;
+        self.changed.notify_all();
+    }
+
+    #[cfg(test)]
+    fn wait_for_state(&self, expected: WorkerState, timeout: Duration) -> bool {
+        let state = self.state.lock().unwrap();
+        let (state, wait) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| *state != expected)
+            .unwrap();
+        !wait.timed_out() && *state == expected
+    }
+}
+
 #[derive(Clone)]
 pub struct SymbolizerWorkerClient {
     requests: SyncSender<SymbolizeRequest>,
     request_timeout: Duration,
+    lifecycle: Arc<WorkerLifecycle>,
 }
 
-impl Symbolizer for SymbolizerWorkerClient {
-    fn symbolize(&self, addr: u64) -> Result<Symbolized, SymbolizeError> {
+impl SymbolizerWorkerClient {
+    fn symbolize_inner<BeforeSend, AfterSend>(
+        &self,
+        addr: u64,
+        before_send: BeforeSend,
+        after_send: AfterSend,
+    ) -> Result<Symbolized, SymbolizeError>
+    where
+        BeforeSend: FnOnce(),
+        AfterSend: FnOnce(),
+    {
+        if let Some(error) = self.lifecycle.terminal_error() {
+            return Err(error);
+        }
+
         let (reply, response) = mpsc::sync_channel(1);
+        before_send();
         match self.requests.try_send(SymbolizeRequest { addr, reply }) {
-            Ok(()) => {}
+            Ok(()) => after_send(),
             Err(TrySendError::Full(_)) => return Err(SymbolizeError::QueueFull),
             Err(TrySendError::Disconnected(_)) => {
-                return Err(SymbolizeError::WorkerStopped)
+                return Err(self
+                    .lifecycle
+                    .terminal_error()
+                    .unwrap_or(SymbolizeError::WorkerStopped))
             }
         }
 
         match response.recv_timeout(self.request_timeout) {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => Err(SymbolizeError::Timeout),
-            Err(RecvTimeoutError::Disconnected) => Err(SymbolizeError::WorkerStopped),
+            Err(RecvTimeoutError::Disconnected) => Err(self
+                .lifecycle
+                .terminal_error()
+                .unwrap_or(SymbolizeError::WorkerStopped)),
         }
+    }
+}
+
+impl Symbolizer for SymbolizerWorkerClient {
+    fn symbolize(&self, addr: u64) -> Result<Symbolized, SymbolizeError> {
+        self.symbolize_inner(addr, || {}, || {})
     }
 
     fn cross_check(&self, addr: u64, expected_top_frame: &str) -> Option<String> {
@@ -124,16 +258,27 @@ impl Symbolizer for SymbolizerWorkerClient {
 pub struct SymbolizerWorkerHandle {
     shutdown: mpsc::Sender<()>,
     join: Option<JoinHandle<()>>,
+    lifecycle: Arc<WorkerLifecycle>,
 }
 
 impl SymbolizerWorkerHandle {
     pub fn shutdown(mut self) -> Result<(), SymbolizeError> {
-        let signal_result = self.shutdown.send(());
+        let shutdown_requested = self.lifecycle.request_shutdown();
+        let _ = self.shutdown.send(());
         let join = self.join.take().ok_or(SymbolizeError::WorkerStopped)?;
         match join.join() {
-            Ok(()) if signal_result.is_ok() => Ok(()),
+            Ok(()) if shutdown_requested => Ok(()),
             Ok(()) => Err(SymbolizeError::WorkerStopped),
             Err(_) => Err(SymbolizeError::WorkerPanic),
+        }
+    }
+}
+
+impl Drop for SymbolizerWorkerHandle {
+    fn drop(&mut self) {
+        if self.join.is_some() {
+            let _ = self.lifecycle.request_shutdown();
+            let _ = self.shutdown.send(());
         }
     }
 }
@@ -164,6 +309,8 @@ where
     let (requests, request_rx) = mpsc::sync_channel(config.queue_capacity);
     let (shutdown, shutdown_rx) = mpsc::channel();
     let (initialized, initialized_rx) = mpsc::sync_channel(1);
+    let lifecycle = Arc::new(WorkerLifecycle::new());
+    let worker_lifecycle = Arc::clone(&lifecycle);
 
     let join = thread::Builder::new()
         .name("fovea-symbolizer".into())
@@ -171,18 +318,26 @@ where
             let mut backend = match catch_unwind(AssertUnwindSafe(factory)) {
                 Ok(Ok(backend)) => backend,
                 Ok(Err(error)) => {
+                    worker_lifecycle.mark_stopped();
                     let _ = initialized.send(Err(error));
                     return;
                 }
                 Err(payload) => {
+                    worker_lifecycle.mark_panicked();
                     drop(initialized);
                     std::panic::resume_unwind(payload);
                 }
             };
             if initialized.send(Ok(())).is_err() {
+                worker_lifecycle.mark_stopped();
                 return;
             }
-            worker_loop(&mut backend, request_rx, shutdown_rx);
+            worker_loop(
+                &mut backend,
+                request_rx,
+                shutdown_rx,
+                worker_lifecycle,
+            );
         })
         .map_err(|error| SymbolizeError::Backend {
             reason: error.to_string(),
@@ -193,10 +348,12 @@ where
             SymbolizerWorkerClient {
                 requests,
                 request_timeout: config.request_timeout,
+                lifecycle: Arc::clone(&lifecycle),
             },
             SymbolizerWorkerHandle {
                 shutdown,
                 join: Some(join),
+                lifecycle,
             },
         )),
         Ok(Err(error)) => {
@@ -214,30 +371,69 @@ fn worker_loop<B: WorkerBackend>(
     backend: &mut B,
     requests: Receiver<SymbolizeRequest>,
     shutdown: Receiver<()>,
+    lifecycle: Arc<WorkerLifecycle>,
 ) {
     loop {
         match shutdown.try_recv() {
-            Ok(()) | Err(TryRecvError::Disconnected) => return,
+            Ok(()) | Err(TryRecvError::Disconnected) => {
+                let _ = lifecycle.request_shutdown();
+            }
             Err(TryRecvError::Empty) => {}
+        }
+        if lifecycle.is_shutdown_requested() {
+            reject_pending_requests(&requests, SymbolizeError::WorkerStopped);
+            lifecycle.mark_stopped();
+            return;
         }
 
         match requests.recv_timeout(WORKER_POLL_INTERVAL) {
             Ok(request) => {
+                if let Err(error) = lifecycle.begin_request() {
+                    let _ = request.reply.send(Err(error.clone()));
+                    reject_pending_requests(&requests, error);
+                    lifecycle.mark_stopped();
+                    return;
+                }
                 let result =
                     catch_unwind(AssertUnwindSafe(|| backend.symbolize(request.addr)));
                 match result {
                     Ok(result) => {
                         let _ = request.reply.send(result);
+                        if lifecycle.finish_request() {
+                            reject_pending_requests(
+                                &requests,
+                                SymbolizeError::WorkerStopped,
+                            );
+                            lifecycle.mark_stopped();
+                            return;
+                        }
                     }
                     Err(payload) => {
+                        lifecycle.mark_panicked();
                         let _ = request.reply.send(Err(SymbolizeError::WorkerPanic));
+                        reject_pending_requests(
+                            &requests,
+                            SymbolizeError::WorkerPanic,
+                        );
                         std::panic::resume_unwind(payload);
                     }
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Disconnected) => {
+                lifecycle.mark_stopped();
+                return;
+            }
         }
+    }
+}
+
+fn reject_pending_requests(
+    requests: &Receiver<SymbolizeRequest>,
+    error: SymbolizeError,
+) {
+    while let Ok(request) = requests.try_recv() {
+        let _ = request.reply.send(Err(error.clone()));
     }
 }
 
@@ -344,6 +540,7 @@ mod tests {
     use super::*;
     use std::borrow::Cow;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
     fn config(queue_capacity: usize, request_timeout: Duration) -> SymbolizerWorkerConfig {
@@ -673,6 +870,86 @@ mod tests {
         );
     }
 
+    struct ShutdownRaceBackend {
+        entered: mpsc::Sender<()>,
+        release: Receiver<()>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl WorkerBackend for ShutdownRaceBackend {
+        fn symbolize(&mut self, addr: u64) -> Result<Symbolized, SymbolizeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if addr == 1 {
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+            Ok(make_symbolized(
+                format!("frame_{addr}"),
+                SymbolConfidence::Kallsyms,
+            ))
+        }
+    }
+
+    #[test]
+    fn shutdown_wins_before_racing_request_execution() {
+        let (entered, entered_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend_calls = Arc::clone(&calls);
+        let (client, handle) = spawn_worker(
+            config(2, Duration::from_secs(2)),
+            move || {
+                Ok(ShutdownRaceBackend {
+                    entered,
+                    release: release_rx,
+                    calls: backend_calls,
+                })
+            },
+        )
+        .unwrap();
+
+        let active_client = client.clone();
+        let active = thread::spawn(move || active_client.symbolize(1));
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (before_send, before_send_rx) = mpsc::channel();
+        let (continue_send, continue_send_rx) = mpsc::channel();
+        let (accepted, accepted_rx) = mpsc::channel();
+        let racing_client = client.clone();
+        let racing = thread::spawn(move || {
+            racing_client.symbolize_inner(
+                2,
+                move || {
+                    before_send.send(()).unwrap();
+                    continue_send_rx.recv().unwrap();
+                },
+                move || accepted.send(()).unwrap(),
+            )
+        });
+        before_send_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let lifecycle = Arc::clone(&client.lifecycle);
+        let shutdown = thread::spawn(move || handle.shutdown());
+        assert!(lifecycle.wait_for_state(
+            WorkerState::ShutdownRequested,
+            Duration::from_secs(1)
+        ));
+
+        continue_send.send(()).unwrap();
+        accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        release.send(()).unwrap();
+
+        assert_eq!(active.join().unwrap().unwrap().name, "frame_1");
+        assert_eq!(
+            racing.join().unwrap().unwrap_err(),
+            SymbolizeError::WorkerStopped
+        );
+        assert_eq!(shutdown.join().unwrap(), Ok(()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     struct PanicBackend;
 
     impl WorkerBackend for PanicBackend {
@@ -689,6 +966,67 @@ mod tests {
 
         assert_eq!(
             client.symbolize(1).unwrap_err(),
+            SymbolizeError::WorkerPanic
+        );
+        assert_eq!(handle.shutdown(), Err(SymbolizeError::WorkerPanic));
+    }
+
+    struct ControlledPanicBackend {
+        entered: mpsc::Sender<()>,
+        panic_now: Receiver<()>,
+    }
+
+    impl WorkerBackend for ControlledPanicBackend {
+        fn symbolize(&mut self, addr: u64) -> Result<Symbolized, SymbolizeError> {
+            if addr == 1 {
+                self.entered.send(()).unwrap();
+                self.panic_now.recv().unwrap();
+                panic!("controlled fixture panic");
+            }
+            Ok(make_symbolized(
+                format!("frame_{addr}"),
+                SymbolConfidence::Kallsyms,
+            ))
+        }
+    }
+
+    #[test]
+    fn active_backend_panic_reaches_already_queued_caller() {
+        let (entered, entered_rx) = mpsc::channel();
+        let (panic_now, panic_now_rx) = mpsc::channel();
+        let (client, handle) = spawn_worker(
+            config(2, Duration::from_secs(2)),
+            move || {
+                Ok(ControlledPanicBackend {
+                    entered,
+                    panic_now: panic_now_rx,
+                })
+            },
+        )
+        .unwrap();
+
+        let active_client = client.clone();
+        let active = thread::spawn(move || active_client.symbolize(1));
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (accepted, accepted_rx) = mpsc::channel();
+        let queued_client = client.clone();
+        let queued = thread::spawn(move || {
+            queued_client.symbolize_inner(
+                2,
+                || {},
+                move || accepted.send(()).unwrap(),
+            )
+        });
+        accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        panic_now.send(()).unwrap();
+        assert_eq!(
+            active.join().unwrap().unwrap_err(),
+            SymbolizeError::WorkerPanic
+        );
+        assert_eq!(
+            queued.join().unwrap().unwrap_err(),
             SymbolizeError::WorkerPanic
         );
         assert_eq!(handle.shutdown(), Err(SymbolizeError::WorkerPanic));
