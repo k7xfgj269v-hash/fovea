@@ -47,6 +47,7 @@ impl IntrospectService {
     }
 
     pub fn introspect(&self, pid: i32) -> Result<Level0, ProcError> {
+        validate_requested_pid(pid)?;
         introspect_from_ports(
             self.source.as_ref(),
             self.symbolizer.as_ref(),
@@ -59,6 +60,8 @@ impl IntrospectService {
 
 /// Compatibility entry point. It only assembles platform adapters.
 pub fn introspect(pid: i32) -> Result<Level0, ProcError> {
+    validate_requested_pid(pid)?;
+
     #[cfg(target_os = "linux")]
     {
         use crate::proc_source::LinuxProcSource;
@@ -75,12 +78,14 @@ pub fn introspect(pid: i32) -> Result<Level0, ProcError> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = pid;
-        Err(ProcError::NotImplemented)
+        Err(ProcError::UnsupportedPlatform)
     }
 }
 
 /// Compatibility helper for callers that inject only a symbolizer.
 pub fn introspect_with(pid: i32, symbolizer: &dyn Symbolizer) -> Result<Level0, ProcError> {
+    validate_requested_pid(pid)?;
+
     #[cfg(target_os = "linux")]
     {
         use crate::proc_source::LinuxProcSource;
@@ -99,7 +104,7 @@ pub fn introspect_with(pid: i32, symbolizer: &dyn Symbolizer) -> Result<Level0, 
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (pid, symbolizer);
-        Err(ProcError::NotImplemented)
+        Err(ProcError::UnsupportedPlatform)
     }
 }
 
@@ -110,7 +115,9 @@ fn introspect_from_ports(
     sample_interval: Duration,
     pid: i32,
 ) -> Result<Level0, ProcError> {
+    validate_requested_pid(pid)?;
     let snapshot = source.snapshot(pid)?;
+    validate_page_size(snapshot.page_size_bytes)?;
     let stat = proc_view::parse_stat(&snapshot.stat)?;
     validate_snapshot_pid(pid, stat.pid)?;
 
@@ -128,6 +135,20 @@ fn introspect_from_ports(
     )?;
 
     build_level0(pid, &snapshot, stat, cpu_sample, symbolizer)
+}
+
+fn validate_requested_pid(pid: i32) -> Result<(), ProcError> {
+    if pid < 1 {
+        return Err(ProcError::InvalidPid { pid });
+    }
+    Ok(())
+}
+
+fn validate_page_size(page_size_bytes: u64) -> Result<(), ProcError> {
+    if page_size_bytes == 0 {
+        return Err(ProcError::InvalidPageSize);
+    }
+    Ok(())
 }
 
 fn validate_snapshot_pid(requested_pid: i32, observed_pid: i32) -> Result<(), ProcError> {
@@ -174,11 +195,7 @@ fn sample_cpu(
     let end = match source.cpu_counters(pid) {
         Ok(counters) => counters,
         Err(error @ ProcError::ProcNotFound { .. }) => return Err(error),
-        Err(error) => {
-            return Ok(CpuSample::unavailable(format!(
-                "CPU 短采样不可用：{error}"
-            )));
-        }
+        Err(_) => return Err(ProcError::CpuSampleFailed),
     };
 
     Ok(calculate_cpu_percent(start, end, logical_cpus))
@@ -304,6 +321,7 @@ pub fn introspect_with_inputs(
     stack_s: &str,
     symbolizer: &dyn Symbolizer,
 ) -> Result<Level0, ProcError> {
+    validate_requested_pid(pid)?;
     let snapshot = ProcSnapshot {
         stat: stat_s.to_string(),
         status: status_s.to_string(),
@@ -732,16 +750,36 @@ mod tests {
     }
 
     #[test]
-    fn contract_second_sample_structured_failures_are_low_confidence() {
-        assert_low_cpu_sample(Err(ProcError::Permission), 4, "权限");
-        assert_low_cpu_sample(
-            Err(ProcError::Parse {
+    fn contract_second_sample_source_failures_are_distinct_and_fatal() {
+        for source_error in [
+            ProcError::Permission,
+            ProcError::Read {
+                what: "/private/host/path".into(),
+                reason: "secret detail".into(),
+            },
+            ProcError::Parse {
                 what: "stat.utime".into(),
                 reason: "not a number".into(),
-            }),
-            4,
-            "stat.utime",
-        );
+            },
+        ] {
+            let snapshot =
+                base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4096, 1, 0));
+            let source = Arc::new(MockProcSource::new(snapshot, [Err(source_error)]));
+            let error = service(
+                source,
+                Arc::new(RecordingClock::default()),
+                Duration::from_millis(1),
+            )
+            .introspect(42)
+            .expect_err("CPU source failures must abort introspection");
+
+            assert_eq!(error, ProcError::CpuSampleFailed);
+            let (kind, reason, next_step) = error.to_error_report();
+            assert_eq!(kind, "proc_cpu_sample_failed");
+            assert!(!reason.contains("/private/host/path"));
+            assert!(!reason.contains("secret detail"));
+            assert!(next_step.is_some());
+        }
     }
 
     #[test]
@@ -803,8 +841,19 @@ mod tests {
 
     #[cfg(not(target_os = "linux"))]
     #[test]
-    fn compatibility_entry_is_not_implemented_off_linux() {
-        assert!(matches!(introspect(1), Err(ProcError::NotImplemented)));
+    fn compatibility_entries_report_unsupported_platform_off_linux() {
+        assert!(matches!(
+            introspect(0),
+            Err(ProcError::InvalidPid { pid: 0 })
+        ));
+        assert!(matches!(
+            introspect(1),
+            Err(ProcError::UnsupportedPlatform)
+        ));
+        assert!(matches!(
+            introspect_with(1, &FallbackSymbolizer),
+            Err(ProcError::UnsupportedPlatform)
+        ));
     }
 
     #[test]
@@ -949,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn counter_rollbacks_zero_delta_and_unavailable_sample_are_low_confidence() {
+    fn counter_rollbacks_zero_delta_and_invalid_cpu_count_are_low_confidence() {
         assert_low_cpu_sample(
             Ok(CpuCounters {
                 process_ticks: 149,
@@ -973,14 +1022,6 @@ mod tests {
             }),
             4,
             "增量为 0",
-        );
-        assert_low_cpu_sample(
-            Err(ProcError::Read {
-                what: "/proc/stat".into(),
-                reason: "temporarily unavailable".into(),
-            }),
-            4,
-            "短采样不可用",
         );
         assert_low_cpu_sample(
             Ok(CpuCounters {
@@ -1008,6 +1049,58 @@ mod tests {
         .introspect(42)
         .expect_err("process disappearance must abort introspection");
         assert_eq!(error, ProcError::ProcNotFound { pid: 42 });
+    }
+
+    struct PanicProcSource;
+
+    impl ProcSource for PanicProcSource {
+        fn snapshot(&self, _pid: i32) -> Result<ProcSnapshot, ProcError> {
+            panic!("invalid pid must be rejected before ProcSource::snapshot")
+        }
+
+        fn cpu_counters(&self, _pid: i32) -> Result<CpuCounters, ProcError> {
+            panic!("invalid pid must be rejected before ProcSource::cpu_counters")
+        }
+    }
+
+    #[test]
+    fn invalid_pid_is_rejected_before_proc_source_is_called() {
+        for pid in [0, -1, i32::MIN] {
+            let error = service(
+                Arc::new(PanicProcSource),
+                Arc::new(RecordingClock::default()),
+                Duration::ZERO,
+            )
+            .introspect(pid)
+            .expect_err("pid below one must be rejected");
+
+            assert_eq!(error, ProcError::InvalidPid { pid });
+            let (kind, reason, next_step) = error.to_error_report();
+            assert_eq!(kind, "proc_invalid_pid");
+            assert!(reason.contains(&pid.to_string()));
+            assert!(next_step.is_some());
+        }
+    }
+
+    #[test]
+    fn zero_page_size_is_rejected_before_cpu_sampling() {
+        let mut snapshot =
+            base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4096, 1, 0));
+        snapshot.page_size_bytes = 0;
+        let clock = Arc::new(RecordingClock::default());
+        let error = service(
+            Arc::new(MockProcSource::new(snapshot, [])),
+            clock.clone(),
+            Duration::from_millis(1),
+        )
+        .introspect(42)
+        .expect_err("zero page size must not be accepted");
+
+        assert_eq!(error, ProcError::InvalidPageSize);
+        let (kind, _, next_step) = error.to_error_report();
+        assert_eq!(kind, "proc_invalid_page_size");
+        assert!(next_step.is_some());
+        assert!(clock.sleeps.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1241,5 +1334,39 @@ mod tests {
         assert_eq!(kind, "proc_not_found");
         assert!(reason.contains("999"));
         assert!(next_step.is_some());
+    }
+
+    #[test]
+    fn proc_error_reports_do_not_echo_internal_paths_or_reasons() {
+        for error in [
+            ProcError::Read {
+                what: "/Users/private/project/secret".into(),
+                reason: "username and dependency version".into(),
+            },
+            ProcError::Parse {
+                what: "/Users/private/project/secret".into(),
+                reason: "username and dependency version".into(),
+            },
+        ] {
+            let (_, reason, next_step) = error.to_error_report();
+            assert!(!reason.contains("/Users/private/project/secret"));
+            assert!(!reason.contains("username and dependency version"));
+            assert!(next_step.is_some());
+        }
+    }
+
+    #[test]
+    fn new_proc_error_variants_are_structured_and_serializable() {
+        for error in [
+            ProcError::InvalidPid { pid: 0 },
+            ProcError::UnsupportedPlatform,
+            ProcError::InvalidPageSize,
+            ProcError::CpuSampleFailed,
+        ] {
+            let encoded = serde_json::to_string(&error).expect("ProcError must serialize");
+            let decoded: ProcError =
+                serde_json::from_str(&encoded).expect("ProcError must deserialize");
+            assert_eq!(decoded, error);
+        }
     }
 }

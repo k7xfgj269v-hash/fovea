@@ -33,6 +33,8 @@ pub struct CpuCounters {
 #[derive(Debug, Error, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProcError {
+    #[error("pid {pid} 无效")]
+    InvalidPid { pid: i32 },
     #[error("pid {pid} 不存在")]
     ProcNotFound { pid: i32 },
     #[error("读 /proc 权限不足")]
@@ -41,6 +43,12 @@ pub enum ProcError {
     Read { what: String, reason: String },
     #[error("解析 {what} 失败：{reason}")]
     Parse { what: String, reason: String },
+    #[error("当前平台不支持 proc introspection")]
+    UnsupportedPlatform,
+    #[error("运行时页大小无效")]
+    InvalidPageSize,
+    #[error("CPU 短采样读取失败")]
+    CpuSampleFailed,
     #[error("尚未实现（M1 第二刀）")]
     NotImplemented,
 }
@@ -48,6 +56,11 @@ pub enum ProcError {
 impl ProcError {
     pub fn to_error_report(&self) -> (&'static str, String, Option<&'static str>) {
         match self {
+            ProcError::InvalidPid { pid } => (
+                "proc_invalid_pid",
+                format!("pid {pid} 无效"),
+                Some("传入大于等于 1 的进程 ID"),
+            ),
             ProcError::ProcNotFound { pid } => (
                 "proc_not_found",
                 format!("pid {pid} 不存在或已退出"),
@@ -58,15 +71,36 @@ impl ProcError {
                 "读 /proc/<pid>/ 权限不足".into(),
                 Some("guest-agent 需挂足够权限（root 或 CAP_SYS_PTRACE 等）"),
             ),
-            ProcError::Read { what, reason } => (
+            ProcError::Read { .. } => (
                 "proc_read_failed",
-                format!("读取 {what} 失败：{reason}"),
-                Some("确认 procfs 已挂载且目标内核暴露所需文件"),
+                "读取必要的 procfs 数据失败".into(),
+                Some("确认 procfs 已挂载、目标进程仍存活且读取权限充足"),
             ),
-            ProcError::Parse { what, reason } => (
-                "proc_parse_failed",
-                format!("解析 {what} 失败：{reason}"),
-                Some("大概率是 /proc 行格式漂移；对齐到目标内核版本"),
+            ProcError::Parse { what, .. } => {
+                let reason = match public_proc_field(what) {
+                    Some(field) => format!("procfs 数据字段 {field} 格式无效"),
+                    None => "procfs 数据格式无效".into(),
+                };
+                (
+                    "proc_parse_failed",
+                    reason,
+                    Some("确认目标内核 procfs 格式与 guest-agent 兼容"),
+                )
+            }
+            ProcError::UnsupportedPlatform => (
+                "proc_unsupported_platform",
+                "proc introspection 仅支持 Linux".into(),
+                Some("在 Linux guest 中运行 guest-agent"),
+            ),
+            ProcError::InvalidPageSize => (
+                "proc_invalid_page_size",
+                "运行时页大小无效，无法计算 RSS 字节数".into(),
+                Some("检查 libc sysconf(_SC_PAGESIZE) 与 guest 运行环境"),
+            ),
+            ProcError::CpuSampleFailed => (
+                "proc_cpu_sample_failed",
+                "CPU 短采样计数器读取失败".into(),
+                Some("确认目标进程仍可读取后重试 introspect"),
             ),
             ProcError::NotImplemented => (
                 "not_implemented",
@@ -74,6 +108,31 @@ impl ProcError {
                 None,
             ),
         }
+    }
+}
+
+fn public_proc_field(what: &str) -> Option<&str> {
+    const EXACT_FIELDS: [&str; 7] = [
+        "stat",
+        "status",
+        "maps",
+        "cgroup",
+        "proc_stat.cpu",
+        "proc_stat.logical_cpus",
+        "fd entry",
+    ];
+    let is_named_field = ["stat.", "status."].iter().any(|prefix| {
+        what.strip_prefix(prefix).is_some_and(|field| {
+            !field.is_empty()
+                && field
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+    });
+    if EXACT_FIELDS.contains(&what) || is_named_field {
+        Some(what)
+    } else {
+        None
     }
 }
 
@@ -219,10 +278,7 @@ mod linux {
         // SAFETY: sysconf is a public libc ABI and _SC_PAGESIZE takes no pointer arguments.
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if page_size <= 0 {
-            return Err(ProcError::Parse {
-                what: "sysconf(_SC_PAGESIZE)".into(),
-                reason: format!("返回无效页大小 {page_size}"),
-            });
+            return Err(ProcError::InvalidPageSize);
         }
         Ok(page_size as u64)
     }
