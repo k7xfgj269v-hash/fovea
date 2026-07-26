@@ -22,11 +22,12 @@ pub struct ProcSnapshot {
     pub page_size_bytes: u64,
 }
 
-/// The two counters used by the short CPU sample.
+/// Counter state used by the short CPU sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuCounters {
     pub process_ticks: u64,
     pub system_ticks: u64,
+    pub process_start_time_ticks: u64,
 }
 
 /// Structured procfs failure modes.
@@ -147,6 +148,57 @@ pub trait SampleClock: Send + Sync {
     fn sleep(&self, duration: Duration);
 }
 
+#[cfg(target_os = "linux")]
+const ESRCH_RAW_OS_ERROR: i32 = libc::ESRCH;
+#[cfg(all(test, not(target_os = "linux")))]
+const ESRCH_RAW_OS_ERROR: i32 = 3;
+
+#[cfg(any(test, target_os = "linux"))]
+fn read_adjacent_cpu_pair<Process, System, ReadProcess, ReadSystem>(
+    mut read_process: ReadProcess,
+    mut read_system: ReadSystem,
+) -> Result<(Process, System), ProcError>
+where
+    ReadProcess: FnMut() -> Result<Process, ProcError>,
+    ReadSystem: FnMut() -> Result<System, ProcError>,
+{
+    let process = read_process()?;
+    let system = read_system()?;
+    Ok((process, system))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcIoScope {
+    Process,
+    Global,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcIoErrorClass {
+    ProcNotFound,
+    Permission,
+    InvalidData,
+    Other,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn classify_proc_io(error: &std::io::Error, scope: ProcIoScope) -> ProcIoErrorClass {
+    if scope == ProcIoScope::Process
+        && (error.kind() == std::io::ErrorKind::NotFound
+            || error.raw_os_error() == Some(ESRCH_RAW_OS_ERROR))
+    {
+        return ProcIoErrorClass::ProcNotFound;
+    }
+
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => ProcIoErrorClass::Permission,
+        std::io::ErrorKind::InvalidData => ProcIoErrorClass::InvalidData,
+        _ => ProcIoErrorClass::Other,
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ThreadSampleClock;
 
@@ -165,7 +217,10 @@ mod linux {
 
     use introspect_schema::RunState;
 
-    use super::{CpuCounters, ProcError, ProcSnapshot, ProcSource};
+    use super::{
+        classify_proc_io, read_adjacent_cpu_pair, CpuCounters, ProcError, ProcIoErrorClass,
+        ProcIoScope, ProcSnapshot, ProcSource,
+    };
     use crate::proc_view::{parse_cgroup, parse_stat, parse_system_cpu};
 
     #[derive(Debug, Default, Clone, Copy)]
@@ -179,7 +234,10 @@ mod linux {
 
     impl ProcSource for LinuxProcSource {
         fn snapshot(&self, pid: i32) -> Result<ProcSnapshot, ProcError> {
-            let stat = read_required_string(pid, "stat")?;
+            let (stat, system) = read_adjacent_cpu_pair(
+                || read_required_string(pid, "stat"),
+                read_system_cpu,
+            )?;
             let parsed_stat = parse_stat(&stat)?;
             let status = read_required_string(pid, "status")?;
             let maps = read_required_string(pid, "maps")?;
@@ -196,7 +254,6 @@ mod linux {
                 Some(content) => parse_cgroup(&content)?,
                 None => None,
             };
-            let system = read_system_cpu()?;
             let page_size_bytes = page_size_bytes()?;
 
             Ok(ProcSnapshot {
@@ -216,11 +273,15 @@ mod linux {
         }
 
         fn cpu_counters(&self, pid: i32) -> Result<CpuCounters, ProcError> {
-            let stat = parse_stat(&read_required_string(pid, "stat")?)?;
-            let system = read_system_cpu()?;
+            let (stat, system) = read_adjacent_cpu_pair(
+                || read_required_string(pid, "stat"),
+                read_system_cpu,
+            )?;
+            let stat = parse_stat(&stat)?;
             Ok(CpuCounters {
                 process_ticks: stat.process_ticks,
                 system_ticks: system.ticks,
+                process_start_time_ticks: stat.process_start_time_ticks,
             })
         }
     }
@@ -302,14 +363,14 @@ mod linux {
     }
 
     fn map_process_io(error: Error, pid: i32, path: &Path) -> ProcError {
-        match error.kind() {
-            ErrorKind::NotFound => ProcError::ProcNotFound { pid },
-            ErrorKind::PermissionDenied => ProcError::Permission,
-            ErrorKind::InvalidData => ProcError::Parse {
+        match classify_proc_io(&error, ProcIoScope::Process) {
+            ProcIoErrorClass::ProcNotFound => ProcError::ProcNotFound { pid },
+            ProcIoErrorClass::Permission => ProcError::Permission,
+            ProcIoErrorClass::InvalidData => ProcError::Parse {
                 what: path.display().to_string(),
                 reason: error.to_string(),
             },
-            _ => ProcError::Read {
+            ProcIoErrorClass::Other => ProcError::Read {
                 what: path.display().to_string(),
                 reason: error.to_string(),
             },
@@ -317,13 +378,13 @@ mod linux {
     }
 
     fn map_global_io(error: Error, path: &Path) -> ProcError {
-        match error.kind() {
-            ErrorKind::PermissionDenied => ProcError::Permission,
-            ErrorKind::InvalidData => ProcError::Parse {
+        match classify_proc_io(&error, ProcIoScope::Global) {
+            ProcIoErrorClass::Permission => ProcError::Permission,
+            ProcIoErrorClass::InvalidData => ProcError::Parse {
                 what: path.display().to_string(),
                 reason: error.to_string(),
             },
-            _ => ProcError::Read {
+            ProcIoErrorClass::ProcNotFound | ProcIoErrorClass::Other => ProcError::Read {
                 what: path.display().to_string(),
                 reason: error.to_string(),
             },
@@ -333,3 +394,67 @@ mod linux {
 
 #[cfg(target_os = "linux")]
 pub use linux::LinuxProcSource;
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::io::{Error, ErrorKind};
+
+    use super::*;
+
+    #[test]
+    fn cpu_pair_reads_process_then_system_without_intervening_reads() {
+        let reads = RefCell::new(Vec::new());
+
+        let pair = read_adjacent_cpu_pair(
+            || {
+                reads.borrow_mut().push("process");
+                Ok::<_, ProcError>(10)
+            },
+            || {
+                reads.borrow_mut().push("system");
+                Ok::<_, ProcError>(20)
+            },
+        )
+        .unwrap();
+        reads.borrow_mut().push("slow_snapshot_read");
+
+        assert_eq!(pair, (10, 20));
+        assert_eq!(
+            reads.into_inner(),
+            ["process", "system", "slow_snapshot_read"]
+        );
+    }
+
+    #[test]
+    fn process_io_maps_not_found_and_esrch_to_proc_not_found() {
+        for error in [
+            Error::new(ErrorKind::NotFound, "gone"),
+            Error::from_raw_os_error(ESRCH_RAW_OS_ERROR),
+        ] {
+            assert_eq!(
+                classify_proc_io(&error, ProcIoScope::Process),
+                ProcIoErrorClass::ProcNotFound
+            );
+        }
+    }
+
+    #[test]
+    fn process_io_keeps_unrelated_errors_non_disappearance() {
+        let unrelated = Error::new(ErrorKind::Other, "unrelated");
+        assert_eq!(
+            classify_proc_io(&unrelated, ProcIoScope::Process),
+            ProcIoErrorClass::Other
+        );
+
+        for error in [
+            Error::new(ErrorKind::NotFound, "global path missing"),
+            Error::from_raw_os_error(ESRCH_RAW_OS_ERROR),
+        ] {
+            assert_ne!(
+                classify_proc_io(&error, ProcIoScope::Global),
+                ProcIoErrorClass::ProcNotFound
+            );
+        }
+    }
+}

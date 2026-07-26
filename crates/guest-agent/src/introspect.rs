@@ -124,6 +124,7 @@ fn introspect_from_ports(
     let start = CpuCounters {
         process_ticks: stat.process_ticks,
         system_ticks: snapshot.system_cpu_ticks,
+        process_start_time_ticks: stat.process_start_time_ticks,
     };
     let cpu_sample = sample_cpu(
         source,
@@ -197,6 +198,9 @@ fn sample_cpu(
         Err(error @ ProcError::ProcNotFound { .. }) => return Err(error),
         Err(_) => return Err(ProcError::CpuSampleFailed),
     };
+    if end.process_start_time_ticks != start.process_start_time_ticks {
+        return Err(ProcError::ProcNotFound { pid });
+    }
 
     Ok(calculate_cpu_percent(start, end, logical_cpus))
 }
@@ -490,6 +494,8 @@ mod tests {
     use crate::symbolize::{make_symbolized, SymbolizeError};
     use introspect_schema::MapKind;
 
+    const TEST_PROCESS_START_TIME_TICKS: u64 = 12_345;
+
     fn stat_line(
         pid: i32,
         comm: &str,
@@ -506,10 +512,19 @@ mod tests {
         fields[11] = utime.to_string();
         fields[12] = stime.to_string();
         fields[17] = nr_threads.to_string();
+        fields[19] = TEST_PROCESS_START_TIME_TICKS.to_string();
         fields[20] = vsize.to_string();
         fields[21] = rss.to_string();
         fields[36] = last_cpu.to_string();
         format!("{pid} ({comm}) {}\n", fields.join(" "))
+    }
+
+    fn cpu_counters(process_ticks: u64, system_ticks: u64) -> CpuCounters {
+        CpuCounters {
+            process_ticks,
+            system_ticks,
+            process_start_time_ticks: TEST_PROCESS_START_TIME_TICKS,
+        }
     }
 
     fn base_snapshot(stat: String) -> ProcSnapshot {
@@ -612,10 +627,7 @@ mod tests {
             Some("[<0000000000000001>] futex_wait_queue_me+0x1/0x2\n".into());
         let source = Arc::new(MockProcSource::new(
             snapshot,
-            [Ok(CpuCounters {
-                process_ticks: 160,
-                system_ticks: 1_100,
-            })],
+            [Ok(cpu_counters(160, 1_100))],
         ));
         let clock = Arc::new(RecordingClock::default());
         let interval = Duration::from_millis(9);
@@ -659,10 +671,7 @@ mod tests {
             snapshot.page_size_bytes = page_size_bytes;
             let source = Arc::new(MockProcSource::new(
                 snapshot,
-                [Ok(CpuCounters {
-                    process_ticks: 0,
-                    system_ticks: 1_001,
-                })],
+                [Ok(cpu_counters(0, 1_001))],
             ));
             service(
                 source,
@@ -690,36 +699,12 @@ mod tests {
     #[test]
     fn contract_cpu_zero_normal_and_multicore_above_100_percent() {
         for (end, logical_cpus, expected) in [
-            (
-                CpuCounters {
-                    process_ticks: 100,
-                    system_ticks: 1_100,
-                },
-                4,
-                0.0,
-            ),
-            (
-                CpuCounters {
-                    process_ticks: 120,
-                    system_ticks: 1_200,
-                },
-                4,
-                40.0,
-            ),
-            (
-                CpuCounters {
-                    process_ticks: 180,
-                    system_ticks: 1_100,
-                },
-                4,
-                320.0,
-            ),
+            (cpu_counters(100, 1_100), 4, 0.0),
+            (cpu_counters(120, 1_200), 4, 40.0),
+            (cpu_counters(180, 1_100), 4, 320.0),
         ] {
             let sample = calculate_cpu_percent(
-                CpuCounters {
-                    process_ticks: 100,
-                    system_ticks: 1_000,
-                },
+                cpu_counters(100, 1_000),
                 end,
                 logical_cpus,
             );
@@ -791,10 +776,7 @@ mod tests {
         snapshot_a.logical_cpus = 2;
         let source_a = Arc::new(MockProcSource::new(
             snapshot_a,
-            [Ok(CpuCounters {
-                process_ticks: 30,
-                system_ticks: 1_100,
-            })],
+            [Ok(cpu_counters(30, 1_100))],
         ));
         let clock_a = Arc::new(RecordingClock::default());
         let interval_a = Duration::from_millis(3);
@@ -809,10 +791,7 @@ mod tests {
         snapshot_b.page_size_bytes = 65_536;
         let source_b = Arc::new(MockProcSource::new(
             snapshot_b,
-            [Ok(CpuCounters {
-                process_ticks: 260,
-                system_ticks: 5_100,
-            })],
+            [Ok(cpu_counters(260, 5_100))],
         ));
         let clock_b = Arc::new(RecordingClock::default());
         let interval_b = Duration::from_millis(7);
@@ -940,10 +919,7 @@ mod tests {
         snapshot.page_size_bytes = 16_384;
         let source = Arc::new(MockProcSource::new(
             snapshot,
-            [Ok(CpuCounters {
-                process_ticks: 170,
-                system_ticks: 1_200,
-            })],
+            [Ok(cpu_counters(170, 1_200))],
         ));
         let clock = Arc::new(RecordingClock::default());
         let interval = Duration::from_millis(25);
@@ -1000,34 +976,22 @@ mod tests {
     #[test]
     fn counter_rollbacks_zero_delta_and_invalid_cpu_count_are_low_confidence() {
         assert_low_cpu_sample(
-            Ok(CpuCounters {
-                process_ticks: 149,
-                system_ticks: 1_200,
-            }),
+            Ok(cpu_counters(149, 1_200)),
             4,
             "进程计数器回退",
         );
         assert_low_cpu_sample(
-            Ok(CpuCounters {
-                process_ticks: 170,
-                system_ticks: 999,
-            }),
+            Ok(cpu_counters(170, 999)),
             4,
             "系统计数器回退",
         );
         assert_low_cpu_sample(
-            Ok(CpuCounters {
-                process_ticks: 170,
-                system_ticks: 1_000,
-            }),
+            Ok(cpu_counters(170, 1_000)),
             4,
             "增量为 0",
         );
         assert_low_cpu_sample(
-            Ok(CpuCounters {
-                process_ticks: 170,
-                system_ticks: 1_200,
-            }),
+            Ok(cpu_counters(170, 1_200)),
             0,
             "logical_cpus",
         );
@@ -1049,6 +1013,50 @@ mod tests {
         .introspect(42)
         .expect_err("process disappearance must abort introspection");
         assert_eq!(error, ProcError::ProcNotFound { pid: 42 });
+    }
+
+    #[test]
+    fn pid_generation_mismatch_is_fatal_even_with_monotonic_counters() {
+        let snapshot =
+            base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4096, 1, 0));
+        let source = Arc::new(MockProcSource::new(
+            snapshot,
+            [Ok(CpuCounters {
+                process_ticks: 170,
+                system_ticks: 1_200,
+                process_start_time_ticks: TEST_PROCESS_START_TIME_TICKS + 1,
+            })],
+        ));
+
+        let error = service(
+            source,
+            Arc::new(RecordingClock::default()),
+            Duration::from_millis(1),
+        )
+        .introspect(42)
+        .expect_err("PID generation reuse must abort introspection");
+
+        assert_eq!(error, ProcError::ProcNotFound { pid: 42 });
+    }
+
+    #[test]
+    fn matching_generation_preserves_cpu_percent() {
+        let snapshot =
+            base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4096, 1, 0));
+        let source = Arc::new(MockProcSource::new(
+            snapshot,
+            [Ok(cpu_counters(170, 1_200))],
+        ));
+
+        let level0 = service(
+            source,
+            Arc::new(RecordingClock::default()),
+            Duration::from_millis(1),
+        )
+        .introspect(42)
+        .expect("matching PID generation must preserve CPU sampling");
+
+        assert!((level0.resource.pct_cpu - 40.0).abs() < f32::EPSILON);
     }
 
     struct PanicProcSource;
@@ -1119,10 +1127,7 @@ mod tests {
         snapshot.page_size_bytes = 2;
         let source = Arc::new(MockProcSource::new(
             snapshot,
-            [Ok(CpuCounters {
-                process_ticks: 0,
-                system_ticks: 1_001,
-            })],
+            [Ok(cpu_counters(0, 1_001))],
         ));
 
         let level0 = service(

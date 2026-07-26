@@ -30,6 +30,8 @@ pub struct Stat {
     pub rss: u64,
     /// stat 字段 14 + 15：进程用户态和内核态累计 ticks。
     pub process_ticks: u64,
+    /// stat 字段 22：进程启动时间，用于识别 PID 对应的进程代际。
+    pub process_start_time_ticks: u64,
     /// stat 第 39 字段：last CPU。
     pub last_cpu: u32,
     // ⚠️ ctxt_switches **不**从 stat 取。man proc 字段 40 = `rt_priority`、
@@ -125,6 +127,10 @@ pub fn parse_stat(content: &str) -> Result<Stat, ProcError> {
     let nr_threads: u32 = need(17, "nr_threads")?
         .parse()
         .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.nr_threads".into(), reason: e.to_string() })?;
+    // 字段 22=starttime => idx 19。
+    let process_start_time_ticks: u64 = need(19, "starttime")?
+        .parse()
+        .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.starttime".into(), reason: e.to_string() })?;
     // 字段 23=vsize => idx 20。
     let vsize: u64 = need(20, "vsize")?
         .parse()
@@ -150,6 +156,7 @@ pub fn parse_stat(content: &str) -> Result<Stat, ProcError> {
         vsize,
         rss: rss_pages,
         process_ticks: utime.saturating_add(stime),
+        process_start_time_ticks,
         last_cpu,
     })
 }
@@ -619,12 +626,14 @@ mod tests {
     //       tail idx: 0=state 1=ppid ... 17=nr_threads 20=vsize 21=rss ...
     //                 36=last_cpu
     fn stat_line(pid: i32, comm: &str, state: &str, nr_threads: u32,
-                 vsize: u64, rss: u64, last_cpu: u32) -> String {
+                 process_start_time_ticks: u64, vsize: u64, rss: u64,
+                 last_cpu: u32) -> String {
         // tail 一共 idx 0..38 = 39 个字段。tail[37]/tail[38] 留 0（= rt_priority/
         // policy 的槽），不再塞假装的 ctxt 值。
         let mut tail: Vec<String> = (0..39).map(|_| "0".to_string()).collect();
         tail[0]  = state.to_string();
         tail[17] = nr_threads.to_string();
+        tail[19] = process_start_time_ticks.to_string();
         tail[20] = vsize.to_string();
         tail[21] = rss.to_string();
         tail[36] = last_cpu.to_string();
@@ -634,7 +643,7 @@ mod tests {
     /// §10 comm 含空格 + 内嵌括号——必须 rfind(')') 切回。
     #[test]
     fn parse_stat_comm_with_space() {
-        let s = stat_line(1, "systemd (init)", "S", 1, 12_345_678, 0, 5);
+        let s = stat_line(1, "systemd (init)", "S", 1, 123_456, 12_345_678, 0, 5);
         let r = parse_stat(&s).expect("comm 含空格/内嵌括号必须可解析");
         assert_eq!(r.pid, 1);
         assert_eq!(r.comm, "systemd (init)"); // 去外层括号、保留内层
@@ -647,7 +656,7 @@ mod tests {
     /// parse_status_extracts_uid_fdsize_and_ctxt。
     #[test]
     fn parse_stat_d_state() {
-        let s = stat_line(42, "demo", "D", 7, 4_000_000, 100_000, 9);
+        let s = stat_line(42, "demo", "D", 7, 987_654, 4_000_000, 100_000, 9);
         let r = parse_stat(&s).expect("最小 D 态样本可解析");
         assert_eq!(r.pid, 42);
         assert_eq!(r.comm, "demo");
@@ -656,6 +665,7 @@ mod tests {
         assert_eq!(r.vsize, 4_000_000);
         assert_eq!(r.rss, 100_000);
         assert_eq!(r.process_ticks, 0);
+        assert_eq!(r.process_start_time_ticks, 987_654);
         assert_eq!(r.last_cpu, 9);
     }
 
@@ -672,6 +682,16 @@ mod tests {
         let stat = format!("42 (cpu-demo) {}\n", tail.join(" "));
 
         assert_eq!(parse_stat(&stat).unwrap().process_ticks, 200);
+    }
+
+    #[test]
+    fn parse_stat_reads_process_start_time_ticks() {
+        let stat = stat_line(42, "generation", "S", 1, 7_654_321, 4096, 1, 0);
+
+        assert_eq!(
+            parse_stat(&stat).unwrap().process_start_time_ticks,
+            7_654_321
+        );
     }
 
     #[test]
