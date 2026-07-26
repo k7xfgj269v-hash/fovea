@@ -569,6 +569,238 @@ mod tests {
         )
     }
 
+    struct PermissionSnapshotSource;
+
+    impl ProcSource for PermissionSnapshotSource {
+        fn snapshot(&self, _pid: i32) -> Result<ProcSnapshot, ProcError> {
+            Err(ProcError::Permission)
+        }
+
+        fn cpu_counters(&self, _pid: i32) -> Result<CpuCounters, ProcError> {
+            panic!("CPU sampling must not run after snapshot failure")
+        }
+    }
+
+    #[test]
+    fn contract_complete_fake_snapshot_populates_level0_without_live_procfs() {
+        let mut snapshot =
+            base_snapshot(stat_line(42, "demo", "D", 100, 50, 2, 4_000_000, 25, 3));
+        snapshot.maps =
+            "7f0000000000-7f0000100000 rw-p 00000000 00:00 0 [heap]\n".into();
+        snapshot.wchan = Some("futex_wait_queue_me\n".into());
+        snapshot.cmdline = b"/usr/bin/demo\0--mode\0contract\0".to_vec();
+        snapshot.fd_names = vec![".".into(), "..".into(), "0".into(), "1".into()];
+        snapshot.kernel_stack =
+            Some("[<0000000000000001>] futex_wait_queue_me+0x1/0x2\n".into());
+        let source = Arc::new(MockProcSource::new(
+            snapshot,
+            [Ok(CpuCounters {
+                process_ticks: 160,
+                system_ticks: 1_100,
+            })],
+        ));
+        let clock = Arc::new(RecordingClock::default());
+        let interval = Duration::from_millis(9);
+
+        let level0 = service(source, clock.clone(), interval)
+            .introspect(42)
+            .expect("complete fake snapshot must assemble Level0");
+
+        assert_eq!(level0.identity.pid, 42);
+        assert_eq!(level0.identity.comm, "demo");
+        assert_eq!(level0.identity.exe.as_deref(), Some("/usr/bin/demo"));
+        assert_eq!(
+            level0.identity.cgroup.as_deref(),
+            Some("/user.slice/demo.scope")
+        );
+        assert_eq!(level0.identity.cmdline.short, "/usr/bin/demo --mode contract");
+        assert_eq!(level0.identity.uid, 1000);
+        assert_eq!(level0.state.run_state, RunState::D);
+        assert_eq!(level0.state.nr_threads, 2);
+        assert_eq!(level0.state.last_cpu, 3);
+        assert_eq!(level0.state.wchan.unwrap().name, "futex_wait_queue_me");
+        assert_eq!(level0.resource.rss_bytes, 25 * 4096);
+        assert_eq!(level0.resource.vsz_bytes, 4_000_000);
+        assert_eq!(level0.resource.nr_fds, 2);
+        assert!((level0.resource.pct_cpu - 40.0).abs() < f32::EPSILON);
+        assert_eq!(level0.resource.ctxt_switches.voluntary, 3);
+        assert_eq!(level0.resource.ctxt_switches.nonvoluntary, 17);
+        assert_eq!(level0.mem_shape.histogram.len(), 1);
+        assert!(matches!(
+            level0.hotspot,
+            Hotspot::Blocked { ref frames } if frames.len() == 1
+        ));
+        assert_eq!(*clock.sleeps.lock().unwrap(), [interval]);
+    }
+
+    #[test]
+    fn contract_runtime_page_sizes_and_saturating_rss_boundary() {
+        let inspect = |rss_pages: u64, page_size_bytes: u64| {
+            let mut snapshot =
+                base_snapshot(stat_line(42, "demo", "S", 0, 0, 1, 4096, rss_pages, 0));
+            snapshot.page_size_bytes = page_size_bytes;
+            let source = Arc::new(MockProcSource::new(
+                snapshot,
+                [Ok(CpuCounters {
+                    process_ticks: 0,
+                    system_ticks: 1_001,
+                })],
+            ));
+            service(
+                source,
+                Arc::new(RecordingClock::default()),
+                Duration::ZERO,
+            )
+            .introspect(42)
+            .unwrap()
+            .resource
+            .rss_bytes
+        };
+
+        assert_eq!(inspect(7, 4096), 7 * 4096);
+        assert_eq!(inspect(7, 65_536), 7 * 65_536);
+
+        let page_size = 65_536;
+        let largest_non_saturating = u64::MAX / page_size;
+        assert_eq!(
+            inspect(largest_non_saturating, page_size),
+            largest_non_saturating * page_size
+        );
+        assert_eq!(inspect(largest_non_saturating + 1, page_size), u64::MAX);
+    }
+
+    #[test]
+    fn contract_cpu_zero_normal_and_multicore_above_100_percent() {
+        for (end, logical_cpus, expected) in [
+            (
+                CpuCounters {
+                    process_ticks: 100,
+                    system_ticks: 1_100,
+                },
+                4,
+                0.0,
+            ),
+            (
+                CpuCounters {
+                    process_ticks: 120,
+                    system_ticks: 1_200,
+                },
+                4,
+                40.0,
+            ),
+            (
+                CpuCounters {
+                    process_ticks: 180,
+                    system_ticks: 1_100,
+                },
+                4,
+                320.0,
+            ),
+        ] {
+            let sample = calculate_cpu_percent(
+                CpuCounters {
+                    process_ticks: 100,
+                    system_ticks: 1_000,
+                },
+                end,
+                logical_cpus,
+            );
+
+            assert!(sample.low_confidence_reason.is_none());
+            assert!(sample.pct_cpu.is_finite());
+            assert!((sample.pct_cpu - expected).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn contract_required_snapshot_permission_is_structured_and_skips_sampling() {
+        let clock = Arc::new(RecordingClock::default());
+        let error = service(
+            Arc::new(PermissionSnapshotSource),
+            clock.clone(),
+            Duration::from_millis(10),
+        )
+        .introspect(42)
+        .expect_err("required snapshot permission failure must be fatal");
+
+        assert_eq!(error, ProcError::Permission);
+        let (kind, reason, next_step) = error.to_error_report();
+        assert_eq!(kind, "proc_permission_denied");
+        assert!(reason.contains("权限"));
+        assert!(next_step.is_some());
+        assert!(clock.sleeps.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn contract_second_sample_structured_failures_are_low_confidence() {
+        assert_low_cpu_sample(Err(ProcError::Permission), 4, "权限");
+        assert_low_cpu_sample(
+            Err(ProcError::Parse {
+                what: "stat.utime".into(),
+                reason: "not a number".into(),
+            }),
+            4,
+            "stat.utime",
+        );
+    }
+
+    #[test]
+    fn contract_concurrent_services_keep_fake_sources_and_clocks_independent() {
+        let mut snapshot_a =
+            base_snapshot(stat_line(101, "alpha", "S", 10, 10, 1, 4096, 2, 0));
+        snapshot_a.exe = Some("/usr/bin/alpha".into());
+        snapshot_a.cgroup = Some("/alpha.scope".into());
+        snapshot_a.logical_cpus = 2;
+        let source_a = Arc::new(MockProcSource::new(
+            snapshot_a,
+            [Ok(CpuCounters {
+                process_ticks: 30,
+                system_ticks: 1_100,
+            })],
+        ));
+        let clock_a = Arc::new(RecordingClock::default());
+        let interval_a = Duration::from_millis(3);
+        let service_a = service(source_a, clock_a.clone(), interval_a);
+
+        let mut snapshot_b =
+            base_snapshot(stat_line(202, "beta", "S", 150, 50, 1, 8192, 3, 1));
+        snapshot_b.exe = Some("/opt/beta".into());
+        snapshot_b.cgroup = Some("/beta.scope".into());
+        snapshot_b.system_cpu_ticks = 5_000;
+        snapshot_b.logical_cpus = 4;
+        snapshot_b.page_size_bytes = 65_536;
+        let source_b = Arc::new(MockProcSource::new(
+            snapshot_b,
+            [Ok(CpuCounters {
+                process_ticks: 260,
+                system_ticks: 5_100,
+            })],
+        ));
+        let clock_b = Arc::new(RecordingClock::default());
+        let interval_b = Duration::from_millis(7);
+        let service_b = service(source_b, clock_b.clone(), interval_b);
+
+        let alpha = std::thread::spawn(move || service_a.introspect(101).unwrap());
+        let beta = std::thread::spawn(move || service_b.introspect(202).unwrap());
+        let alpha = alpha.join().unwrap();
+        let beta = beta.join().unwrap();
+
+        assert_eq!(alpha.identity.comm, "alpha");
+        assert_eq!(alpha.identity.exe.as_deref(), Some("/usr/bin/alpha"));
+        assert_eq!(alpha.identity.cgroup.as_deref(), Some("/alpha.scope"));
+        assert_eq!(alpha.resource.rss_bytes, 2 * 4096);
+        assert!((alpha.resource.pct_cpu - 20.0).abs() < f32::EPSILON);
+
+        assert_eq!(beta.identity.comm, "beta");
+        assert_eq!(beta.identity.exe.as_deref(), Some("/opt/beta"));
+        assert_eq!(beta.identity.cgroup.as_deref(), Some("/beta.scope"));
+        assert_eq!(beta.resource.rss_bytes, 3 * 65_536);
+        assert!((beta.resource.pct_cpu - 240.0).abs() < f32::EPSILON);
+
+        assert_eq!(*clock_a.sleeps.lock().unwrap(), [interval_a]);
+        assert_eq!(*clock_b.sleeps.lock().unwrap(), [interval_b]);
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn compatibility_entry_is_not_implemented_off_linux() {
