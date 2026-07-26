@@ -270,17 +270,15 @@ fn build_confidence(
 
     if let Hotspot::Blocked { frames } = hotspot {
         for frame in frames {
-            let confidence = match (&frame.symbol, frame.confidence) {
-                (Some(_), Some(confidence)) => confidence,
-                _ => SymbolConfidence::None,
-            };
+            let confidence = frame_symbol_confidence(frame);
             symbol_scores.push(confidence.score());
             if confidence == SymbolConfidence::None {
-                low_fields.push(LowConfidenceField {
-                    path: format!("hotspot.frames[{}].symbol", frame.idx),
-                    confidence: Some(SymbolConfidence::None),
-                    reason: "blocked frame symbolization failed or produced no confidence".into(),
-                });
+                merge_low_confidence_field(
+                    &mut low_fields,
+                    format!("hotspot.frames[{}].symbol", frame.idx),
+                    SymbolConfidence::None,
+                    "blocked frame symbolization failed or produced no confidence".into(),
+                );
             }
         }
     }
@@ -296,16 +294,18 @@ fn build_confidence(
             u64::from_str_radix(top_frame.addr.trim_start_matches("0x"), 16).unwrap_or(0);
         if let Some(reason) = sym.cross_check(top_addr, wchan_name) {
             cross_check_failed = true;
-            low_fields.push(LowConfidenceField {
-                path: "state.wchan".into(),
-                confidence: Some(SymbolConfidence::Kallsyms),
-                reason,
-            });
-            low_fields.push(LowConfidenceField {
-                path: "hotspot.frames[0].symbol".into(),
-                confidence: Some(SymbolConfidence::Kallsyms),
-                reason: "wchan/顶帧不自洽：wchan 是可信嫌疑方之一".into(),
-            });
+            merge_low_confidence_field(
+                &mut low_fields,
+                "state.wchan".into(),
+                SymbolConfidence::Kallsyms,
+                reason.clone(),
+            );
+            merge_low_confidence_field(
+                &mut low_fields,
+                format!("hotspot.frames[{}].symbol", top_frame.idx),
+                frame_symbol_confidence(top_frame),
+                format!("wchan/top frame cross-check failed: {reason}"),
+            );
         }
     }
 
@@ -324,6 +324,39 @@ fn build_confidence(
         overall,
         low_fields,
     }
+}
+
+fn frame_symbol_confidence(frame: &StackFrame) -> SymbolConfidence {
+    match (&frame.symbol, frame.confidence) {
+        (Some(_), Some(confidence)) => confidence,
+        _ => SymbolConfidence::None,
+    }
+}
+
+fn merge_low_confidence_field(
+    low_fields: &mut Vec<LowConfidenceField>,
+    path: String,
+    confidence: SymbolConfidence,
+    reason: String,
+) {
+    if let Some(existing) = low_fields.iter_mut().find(|field| field.path == path) {
+        let merged_confidence = match existing.confidence {
+            Some(current) if current.score() <= confidence.score() => current,
+            _ => confidence,
+        };
+        existing.confidence = Some(merged_confidence);
+        if existing.reason != reason {
+            existing.reason.push_str("; ");
+            existing.reason.push_str(&reason);
+        }
+        return;
+    }
+
+    low_fields.push(LowConfidenceField {
+        path,
+        confidence: Some(confidence),
+        reason,
+    });
 }
 
 /// /proc I/O 失败映射到 [`ProcError`]（cfg-gate Linux 才用，Mac 上不编）。
@@ -597,6 +630,43 @@ mod tests {
             .map(|field| field.path.as_str())
             .collect();
         assert_eq!(paths, ["state.wchan", "hotspot.frames[0].symbol"]);
+        assert_eq!(
+            confidence.low_fields[1].confidence,
+            Some(SymbolConfidence::Dwarf)
+        );
+    }
+
+    struct SymbolizationAndCrossCheckFailureSymbolizer;
+
+    impl Symbolizer for SymbolizationAndCrossCheckFailureSymbolizer {
+        fn symbolize(&self, addr: u64) -> Result<Symbolized, SymbolizeError> {
+            Err(SymbolizeError::NotFound {
+                addr: format!("{addr:#x}"),
+            })
+        }
+
+        fn cross_check(&self, _addr: u64, _expected_top_frame: &str) -> Option<String> {
+            Some("wchan/top frame mismatch".into())
+        }
+    }
+
+    #[test]
+    fn failed_top_symbol_and_cross_check_merge_confidence_evidence() {
+        let stack = vec![("1".to_string(), "frame".to_string())];
+        let sym = SymbolizationAndCrossCheckFailureSymbolizer;
+        let hotspot = build_hotspot(RunState::D, &stack, &sym);
+        let confidence = build_confidence(&Some("wchan".into()), &hotspot, &sym);
+
+        assert_eq!(confidence.overall, 0.0);
+        let top_fields: Vec<_> = confidence
+            .low_fields
+            .iter()
+            .filter(|field| field.path == "hotspot.frames[0].symbol")
+            .collect();
+        assert_eq!(top_fields.len(), 1);
+        assert_eq!(top_fields[0].confidence, Some(SymbolConfidence::None));
+        assert!(top_fields[0].reason.contains("symbolization failed"));
+        assert!(top_fields[0].reason.contains("wchan/top frame mismatch"));
     }
 
     /// ProcError::to_error_report 三元组形状——跨 vsock 兜底契约。
