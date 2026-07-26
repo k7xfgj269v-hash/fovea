@@ -441,9 +441,15 @@ mod tests {
 
     #[test]
     fn worker_success_with_thread_owned_non_send_backend() {
+        let caller_thread = thread::current().id();
+        let (factory_thread, factory_thread_rx) = mpsc::channel();
         let (client, handle) = spawn_worker(
             config(4, Duration::from_secs(1)),
-            || {
+            move || {
+                let current = thread::current();
+                factory_thread
+                    .send((current.id(), current.name().map(str::to_owned)))
+                    .unwrap();
                 Ok(EchoBackend {
                     _thread_owned: Rc::new(()),
                 })
@@ -451,6 +457,10 @@ mod tests {
         )
         .unwrap();
 
+        let (backend_thread, backend_thread_name) =
+            factory_thread_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_ne!(backend_thread, caller_thread);
+        assert_eq!(backend_thread_name.as_deref(), Some("fovea-symbolizer"));
         let symbol = client.symbolize(7).unwrap();
         assert_eq!(symbol.name, "frame_7+0x0");
         assert!(client.cross_check(7, "frame_7+0x44").is_none());
@@ -579,6 +589,47 @@ mod tests {
     }
 
     #[test]
+    fn zero_capacity_is_supported_as_a_rendezvous_queue() {
+        let (entered, entered_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let (client, handle) = spawn_worker(
+            config(0, Duration::from_secs(1)),
+            move || {
+                Ok(BlockingBackend {
+                    entered,
+                    release: release_rx,
+                })
+            },
+        )
+        .unwrap();
+
+        let active_client = client.clone();
+        let active = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            loop {
+                match active_client.symbolize(1) {
+                    Err(SymbolizeError::QueueFull)
+                        if std::time::Instant::now() < deadline =>
+                    {
+                        thread::yield_now();
+                    }
+                    result => break result,
+                }
+            }
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert_eq!(
+            client.symbolize(2).unwrap_err(),
+            SymbolizeError::QueueFull
+        );
+
+        release.send(()).unwrap();
+        assert_eq!(active.join().unwrap().unwrap().name, "frame_1");
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
     fn request_timeout_is_distinct() {
         let (entered, entered_rx) = mpsc::channel();
         let (release, release_rx) = mpsc::channel();
@@ -651,6 +702,17 @@ mod tests {
         ) {
             Err(error) => assert_eq!(error, SymbolizeError::NoSymbolFile),
             Ok(_) => panic!("backend initialization failure must abort spawn"),
+        }
+    }
+
+    #[test]
+    fn factory_panic_is_reported_as_worker_panic() {
+        match spawn_worker::<ErrorBackend, _>(
+            config(1, Duration::from_secs(1)),
+            || panic!("fixture factory panic"),
+        ) {
+            Err(error) => assert_eq!(error, SymbolizeError::WorkerPanic),
+            Ok(_) => panic!("backend factory panic must abort spawn"),
         }
     }
 
