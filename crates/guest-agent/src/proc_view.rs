@@ -8,7 +8,7 @@
 //! 不在本模块组合完整 Level 0（那是 [`crate::introspect`] 的事）。Linux 文件 I/O
 //! 全部留在 [`crate::proc_source`]，因此解析测试可以在 Mac 上运行。
 
-use introspect_schema::{MapKind, MemShape, MapKindBucket, RunState, TopMap};
+use introspect_schema::{MapKind, MapKindBucket, MemShape, RunState, TopMap};
 
 pub use crate::proc_source::ProcError;
 
@@ -45,7 +45,7 @@ pub struct Stat {
 /// VmSize 已在 stat 里有多份来源）不去重——本刀只取 identity.uid + fd 上限
 /// （§10 没有 fd 极限字段，但 knowledge 用途放在 §6 第 1 层 know-your-target）
 /// + ctxt_switches（stat 的 40/41 是 rt_priority/policy 不是 ctxt，**只能**从
-/// status 取——这条是 §§ 读侧静默污染防线的代码归宿之一）。
+///   status 取——这条是 §§ 读侧静默污染防线的代码归宿之一）。
 #[derive(Debug, Clone, Default)]
 pub struct Status {
     pub uid: u32,
@@ -86,20 +86,28 @@ pub(crate) const MEM_SHAPE_TOP_N: usize = 5;
 pub fn parse_stat(content: &str) -> Result<Stat, ProcError> {
     let content = content.trim();
     // 先找左括号（接在 pid 后面）。
-    let lparen = content
-        .find('(')
-        .ok_or_else(|| ProcError::Parse { what: "stat".into(), reason: "缺少左括号 (comm)".into() })?;
-    let rparen = content
-        .rfind(')')
-        .ok_or_else(|| ProcError::Parse { what: "stat".into(), reason: "缺少右括号 (comm)".into() })?;
+    let lparen = content.find('(').ok_or_else(|| ProcError::Parse {
+        what: "stat".into(),
+        reason: "缺少左括号 (comm)".into(),
+    })?;
+    let rparen = content.rfind(')').ok_or_else(|| ProcError::Parse {
+        what: "stat".into(),
+        reason: "缺少右括号 (comm)".into(),
+    })?;
     if rparen < lparen {
-        return Err(ProcError::Parse { what: "stat".into(), reason: "右括号在左括号之前".into() });
+        return Err(ProcError::Parse {
+            what: "stat".into(),
+            reason: "右括号在左括号之前".into(),
+        });
     }
     // pid 在左括号之前的第一个字段。
     let pid_str = content[..lparen].trim();
     let pid: i32 = pid_str
         .parse()
-        .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.pid".into(), reason: e.to_string() })?;
+        .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+            what: "stat.pid".into(),
+            reason: e.to_string(),
+        })?;
     // comm = 括号内（去括号）。 不再加回括号——§10 identity.comm 是不带括号的进程名。
     let comm = content[lparen + 1..rparen].to_string();
     // 右括号之后按空格分词。第一个 = state（单字符）。
@@ -116,33 +124,59 @@ pub fn parse_stat(content: &str) -> Result<Stat, ProcError> {
     let state = parse_run_state(need(0, "state")?)?;
     let ppid: i32 = need(1, "ppid")?
         .parse()
-        .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.ppid".into(), reason: e.to_string() })?;
+        .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+            what: "stat.ppid".into(),
+            reason: e.to_string(),
+        })?;
     let utime: u64 = need(11, "utime")?
         .parse()
-        .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.utime".into(), reason: e.to_string() })?;
+        .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+            what: "stat.utime".into(),
+            reason: e.to_string(),
+        })?;
     let stime: u64 = need(12, "stime")?
         .parse()
-        .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.stime".into(), reason: e.to_string() })?;
+        .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+            what: "stat.stime".into(),
+            reason: e.to_string(),
+        })?;
     // 字段 20=nr_threads => idx 17 (20-3)。
-    let nr_threads: u32 = need(17, "nr_threads")?
-        .parse()
-        .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.nr_threads".into(), reason: e.to_string() })?;
+    let nr_threads: u32 =
+        need(17, "nr_threads")?
+            .parse()
+            .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+                what: "stat.nr_threads".into(),
+                reason: e.to_string(),
+            })?;
     // 字段 22=starttime => idx 19。
-    let process_start_time_ticks: u64 = need(19, "starttime")?
-        .parse()
-        .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.starttime".into(), reason: e.to_string() })?;
+    let process_start_time_ticks: u64 =
+        need(19, "starttime")?
+            .parse()
+            .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+                what: "stat.starttime".into(),
+                reason: e.to_string(),
+            })?;
     // 字段 23=vsize => idx 20。
     let vsize: u64 = need(20, "vsize")?
         .parse()
-        .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.vsize".into(), reason: e.to_string() })?;
+        .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+            what: "stat.vsize".into(),
+            reason: e.to_string(),
+        })?;
     // 字段 24=rss => idx 21。rss 在 stat 里是**页数**，不是字节——要之后乘 page size。
     let rss_pages: u64 = need(21, "rss")?
         .parse()
-        .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.rss".into(), reason: e.to_string() })?;
+        .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+            what: "stat.rss".into(),
+            reason: e.to_string(),
+        })?;
     // 字段 39=last_cpu => idx 36。
     let last_cpu: u32 = need(36, "last_cpu")?
         .parse()
-        .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.last_cpu".into(), reason: e.to_string() })?;
+        .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+            what: "stat.last_cpu".into(),
+            reason: e.to_string(),
+        })?;
     // ⚠️ 不读字段 40/41——那是 rt_priority/policy（不是 ctxt）。ctxt 从
     // status 取（见 parse_status）。历史代码 need(37)/need(38) 把 rt_priority/
     // policy 当成 ctxt 是静默错数 bug，同构 fixture 让它在 Mac 单测里测不出。
@@ -191,12 +225,12 @@ pub fn parse_system_cpu(content: &str) -> Result<SystemCpu, ProcError> {
             }
             let mut ticks = 0u64;
             for value in values.into_iter().take(8) {
-                let value = value.parse::<u64>().map_err(
-                    |error: std::num::ParseIntError| ProcError::Parse {
+                let value = value
+                    .parse::<u64>()
+                    .map_err(|error: std::num::ParseIntError| ProcError::Parse {
                         what: "proc_stat.cpu".into(),
                         reason: error.to_string(),
-                    },
-                )?;
+                    })?;
                 ticks = ticks.checked_add(value).ok_or_else(|| ProcError::Parse {
                     what: "proc_stat.cpu".into(),
                     reason: "aggregate cpu ticks 溢出 u64".into(),
@@ -205,10 +239,12 @@ pub fn parse_system_cpu(content: &str) -> Result<SystemCpu, ProcError> {
             aggregate = Some(ticks);
         } else if let Some(index) = name.strip_prefix("cpu") {
             if !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()) {
-                logical_cpus = logical_cpus.checked_add(1).ok_or_else(|| ProcError::Parse {
-                    what: "proc_stat.logical_cpus".into(),
-                    reason: "logical CPU 数溢出 u32".into(),
-                })?;
+                logical_cpus = logical_cpus
+                    .checked_add(1)
+                    .ok_or_else(|| ProcError::Parse {
+                        what: "proc_stat.logical_cpus".into(),
+                        reason: "logical CPU 数溢出 u32".into(),
+                    })?;
             }
         }
     }
@@ -284,30 +320,41 @@ pub fn parse_status(content: &str) -> Result<Status, ProcError> {
         if let Some(rest) = line.strip_prefix("Uid:") {
             // `Uid:\t1000\t1000\t1000\t1000` — 四列 (real/effective/saved/fs)。
             // 取第一列 real uid。
-            let first = rest.trim_start().split_whitespace().next().unwrap_or("0");
-            st.uid = first.parse().map_err(|e: std::num::ParseIntError| ProcError::Parse {
-                what: "status.uid".into(),
-                reason: e.to_string(),
-            })?;
+            let first = rest.split_whitespace().next().unwrap_or("0");
+            st.uid = first
+                .parse()
+                .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+                    what: "status.uid".into(),
+                    reason: e.to_string(),
+                })?;
         } else if let Some(rest) = line.strip_prefix("FDSize:") {
-            let n = rest.trim().parse::<u32>().map_err(|e: std::num::ParseIntError| ProcError::Parse {
-                what: "status.fdsize".into(),
-                reason: e.to_string(),
-            })?;
+            let n = rest
+                .trim()
+                .parse::<u32>()
+                .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+                    what: "status.fdsize".into(),
+                    reason: e.to_string(),
+                })?;
             st.fd_size = Some(n);
         } else if let Some(rest) = line.strip_prefix("voluntary_ctxt_switches:") {
             // 单值行 `voluntary_ctxt_switches:\t<N>`。缺行（stripped 内核偶见）
             // 走 Default=0——best-effort（§11）。**唯一**可靠源：stat 的 40/41
             // 字段是 rt_priority/policy，不能当 ctxt 用。
-            st.voluntary_ctxt_switches = rest.trim().parse::<u64>().map_err(|e: std::num::ParseIntError| ProcError::Parse {
-                what: "status.voluntary_ctxt_switches".into(),
-                reason: e.to_string(),
-            })?;
+            st.voluntary_ctxt_switches =
+                rest.trim()
+                    .parse::<u64>()
+                    .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+                        what: "status.voluntary_ctxt_switches".into(),
+                        reason: e.to_string(),
+                    })?;
         } else if let Some(rest) = line.strip_prefix("nonvoluntary_ctxt_switches:") {
-            st.nonvoluntary_ctxt_switches = rest.trim().parse::<u64>().map_err(|e: std::num::ParseIntError| ProcError::Parse {
-                what: "status.nonvoluntary_ctxt_switches".into(),
-                reason: e.to_string(),
-            })?;
+            st.nonvoluntary_ctxt_switches =
+                rest.trim()
+                    .parse::<u64>()
+                    .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+                        what: "status.nonvoluntary_ctxt_switches".into(),
+                        reason: e.to_string(),
+                    })?;
         }
     }
     Ok(st)
@@ -336,10 +383,11 @@ pub fn parse_maps(content: &str) -> Result<MemShape, ProcError> {
         if line.is_empty() {
             continue;
         }
-        let map = parse_map_line(line)
-            .map_err(|e| ProcError::Parse { what: "maps".into(), reason: e })?;
-        let kind = classify_map_kind(&map.perms, map.path.as_deref())
-            .unwrap_or(MapKind::Anon); // 无 path → Anon；§10 五类里没列的归 Anon 兜底
+        let map = parse_map_line(line).map_err(|e| ProcError::Parse {
+            what: "maps".into(),
+            reason: e,
+        })?;
+        let kind = classify_map_kind(&map.perms, map.path.as_deref()).unwrap_or(MapKind::Anon); // 无 path → Anon；§10 五类里没列的归 Anon 兜底
         let size = map.end.saturating_sub(map.start);
         // 直方图累加
         let entry = buckets.entry(kind).or_insert((0, 0));
@@ -374,10 +422,13 @@ pub fn parse_maps(content: &str) -> Result<MemShape, ProcError> {
     histogram.sort_by_key(|b| b.kind as i32);
 
     // top-N：按 size 降序取前 MEM_SHAPE_TOP_N
-    tops.sort_by(|a, b| b.size.cmp(&a.size));
+    tops.sort_by_key(|map| std::cmp::Reverse(map.size));
     tops.truncate(MEM_SHAPE_TOP_N);
 
-    Ok(MemShape { histogram, top_n: tops })
+    Ok(MemShape {
+        histogram,
+        top_n: tops,
+    })
 }
 
 /// /proc/<pid>/maps 单行解析中间件。
@@ -416,9 +467,7 @@ fn parse_map_line(line: &str) -> Result<MapLine, String> {
     let tokens: Vec<&str> = rest.split_whitespace().collect();
     // tokens[0]=perms, tokens[1]=offset, tokens[2]=dev, tokens[3]=inode, tokens[4..]=path
     let path = if tokens.len() > 4 {
-        let path_start_byte_in_rest = rest
-            .find(tokens[4])
-            .ok_or("path 起点定位失败")?;
+        let path_start_byte_in_rest = rest.find(tokens[4]).ok_or("path 起点定位失败")?;
         Some(rest[path_start_byte_in_rest..].trim().to_string())
     } else {
         None
@@ -548,7 +597,10 @@ pub fn read_kernel_stack_from_str(content: &str) -> Vec<(String, String)> {
         };
         // addr 段在 [...] 内, 可含 < >
         let addr_seg = &line[open + 1..close];
-        let addr = addr_seg.trim_start_matches('<').trim_end_matches('>').to_string();
+        let addr = addr_seg
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .to_string();
         // 符号段是 close 之后第一个非空白 token (直到行尾, 含 +0x... 偏移)
         let sym = line[close + 1..].trim();
         if sym.is_empty() {
@@ -588,9 +640,13 @@ mod tests {
             let s = serde_json::to_string(&c)
                 .unwrap_or_else(|e| panic!("variant #{i} 序列化失败：{e}: {c:?}"));
             // 反序列化回来要等价（按 tag 区分）
-            let back: ProcError =
-                serde_json::from_str(&s).unwrap_or_else(|e| panic!("variant #{i} 反序列化失败：{e}"));
-            assert_eq!(s, serde_json::to_string(&back).unwrap(), "round-trip 不自洽");
+            let back: ProcError = serde_json::from_str(&s)
+                .unwrap_or_else(|e| panic!("variant #{i} 反序列化失败：{e}"));
+            assert_eq!(
+                s,
+                serde_json::to_string(&back).unwrap(),
+                "round-trip 不自洽"
+            );
         }
     }
 
@@ -625,13 +681,21 @@ mod tests {
     /// 其它字段填 0 占位。idx = field# - 3（因为 1=pid 2=comm 不入 tail）。
     //       tail idx: 0=state 1=ppid ... 17=nr_threads 20=vsize 21=rss ...
     //                 36=last_cpu
-    fn stat_line(pid: i32, comm: &str, state: &str, nr_threads: u32,
-                 process_start_time_ticks: u64, vsize: u64, rss: u64,
-                 last_cpu: u32) -> String {
+    #[allow(clippy::too_many_arguments)]
+    fn stat_line(
+        pid: i32,
+        comm: &str,
+        state: &str,
+        nr_threads: u32,
+        process_start_time_ticks: u64,
+        vsize: u64,
+        rss: u64,
+        last_cpu: u32,
+    ) -> String {
         // tail 一共 idx 0..38 = 39 个字段。tail[37]/tail[38] 留 0（= rt_priority/
         // policy 的槽），不再塞假装的 ctxt 值。
         let mut tail: Vec<String> = (0..39).map(|_| "0".to_string()).collect();
-        tail[0]  = state.to_string();
+        tail[0] = state.to_string();
         tail[17] = nr_threads.to_string();
         tail[19] = process_start_time_ticks.to_string();
         tail[20] = vsize.to_string();
@@ -762,18 +826,13 @@ mod tests {
     #[test]
     fn parse_status_rejects_malformed_ctxt_switch_counts_structurally() {
         for (key, expected_what) in [
-            (
-                "voluntary_ctxt_switches",
-                "status.voluntary_ctxt_switches",
-            ),
+            ("voluntary_ctxt_switches", "status.voluntary_ctxt_switches"),
             (
                 "nonvoluntary_ctxt_switches",
                 "status.nonvoluntary_ctxt_switches",
             ),
         ] {
-            let status = format!(
-                "Uid:\t1000\t1000\t1000\t1000\n{key}:\tnot-a-number\n"
-            );
+            let status = format!("Uid:\t1000\t1000\t1000\t1000\n{key}:\tnot-a-number\n");
             let error = parse_status(&status).expect_err("malformed count must fail");
 
             match &error {
@@ -819,8 +878,16 @@ mod tests {
         let output_lines = r.histogram.len() + r.top_n.len();
         // 投影成立：输入 12 行映射 → 出参顶多 5 + 5 = 10 行（实战 GB maps 上千行
         // → 投影，这里数据小但 ratio 必须 ≥ 投影方向）
-        assert!(r.histogram.len() <= 5, "histogram 超过 §10 五类: {:?}", r.histogram);
-        assert!(r.top_n.len() <= MEM_SHAPE_TOP_N, "top_n 超过 N: {}", r.top_n.len());
+        assert!(
+            r.histogram.len() <= 5,
+            "histogram 超过 §10 五类: {:?}",
+            r.histogram
+        );
+        assert!(
+            r.top_n.len() <= MEM_SHAPE_TOP_N,
+            "top_n 超过 N: {}",
+            r.top_n.len()
+        );
         // 5 类里至少应出现 Heap/Stack/XLib/File —— Anon 也一定在（[vdso]/[anon...]/[stack:tid]/纯匿名）
         let kinds: Vec<_> = r.histogram.iter().map(|b| b.kind).collect();
         assert!(kinds.contains(&MapKind::Heap));
@@ -829,7 +896,11 @@ mod tests {
         assert!(kinds.contains(&MapKind::File));
         assert!(kinds.contains(&MapKind::XLib));
         // heap 桶恰好 1 个映射，size = 0x100000
-        let heap = r.histogram.iter().find(|b| b.kind == MapKind::Heap).unwrap();
+        let heap = r
+            .histogram
+            .iter()
+            .find(|b| b.kind == MapKind::Heap)
+            .unwrap();
         assert_eq!(heap.count, 1);
         assert_eq!(heap.total_size, 0x100000);
         // top-N 是按 size 降序——最大的应排第一个
@@ -899,7 +970,15 @@ mod tests {
     #[test]
     fn scan_fds_from_names_counts_real_fds() {
         // /proc/<pid>/fd 目录通常会有 "." ".." 和 fd 编号
-        let names: Vec<String> = vec![".".into(), "..".into(), "0".into(), "1".into(), "2".into(), "3".into(), "17".into()];
+        let names: Vec<String> = vec![
+            ".".into(),
+            "..".into(),
+            "0".into(),
+            "1".into(),
+            "2".into(),
+            "3".into(),
+            "17".into(),
+        ];
         assert_eq!(scan_fds_from_names(&names), 5);
         // 空目录
         assert_eq!(scan_fds_from_names(&[".".into(), "..".into()]), 0);

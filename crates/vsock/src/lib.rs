@@ -97,8 +97,7 @@ impl MockTransport {
 impl Transport for MockTransport {
     async fn send(&self, msg: &Message) -> Result<(), TransportError> {
         let tx = self.tx.lock().await;
-        tx.send(msg.clone())
-            .map_err(|_| TransportError::PeerClosed)
+        tx.send(msg.clone()).map_err(|_| TransportError::PeerClosed)
     }
 
     async fn recv(&self) -> Result<Message, TransportError> {

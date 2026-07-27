@@ -2,9 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::mpsc::{
-    self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError,
-};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -134,9 +132,7 @@ impl WorkerLifecycle {
                 self.changed.notify_all();
                 false
             }
-            WorkerState::ShutdownRequested
-            | WorkerState::Stopped
-            | WorkerState::Panicked => true,
+            WorkerState::ShutdownRequested | WorkerState::Stopped | WorkerState::Panicked => true,
             WorkerState::Running => unreachable!("request was not marked executing"),
         }
     }
@@ -292,9 +288,7 @@ pub fn spawn_kernel_symbolizer(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        spawn_worker::<UnavailableKernelBackend, _>(config, || {
-            Err(SymbolizeError::NoSymbolFile)
-        })
+        spawn_worker::<UnavailableKernelBackend, _>(config, || Err(SymbolizeError::NoSymbolFile))
     }
 }
 
@@ -332,12 +326,7 @@ where
                 worker_lifecycle.mark_stopped();
                 return;
             }
-            worker_loop(
-                &mut backend,
-                request_rx,
-                shutdown_rx,
-                worker_lifecycle,
-            );
+            worker_loop(&mut backend, request_rx, shutdown_rx, worker_lifecycle);
         })
         .map_err(|error| SymbolizeError::Backend {
             reason: error.to_string(),
@@ -394,16 +383,12 @@ fn worker_loop<B: WorkerBackend>(
                     lifecycle.mark_stopped();
                     return;
                 }
-                let result =
-                    catch_unwind(AssertUnwindSafe(|| backend.symbolize(request.addr)));
+                let result = catch_unwind(AssertUnwindSafe(|| backend.symbolize(request.addr)));
                 match result {
                     Ok(result) => {
                         let _ = request.reply.send(result);
                         if lifecycle.finish_request() {
-                            reject_pending_requests(
-                                &requests,
-                                SymbolizeError::WorkerStopped,
-                            );
+                            reject_pending_requests(&requests, SymbolizeError::WorkerStopped);
                             lifecycle.mark_stopped();
                             return;
                         }
@@ -411,10 +396,7 @@ fn worker_loop<B: WorkerBackend>(
                     Err(payload) => {
                         lifecycle.mark_panicked();
                         let _ = request.reply.send(Err(SymbolizeError::WorkerPanic));
-                        reject_pending_requests(
-                            &requests,
-                            SymbolizeError::WorkerPanic,
-                        );
+                        reject_pending_requests(&requests, SymbolizeError::WorkerPanic);
                         std::panic::resume_unwind(payload);
                     }
                 }
@@ -428,10 +410,7 @@ fn worker_loop<B: WorkerBackend>(
     }
 }
 
-fn reject_pending_requests(
-    requests: &Receiver<SymbolizeRequest>,
-    error: SymbolizeError,
-) {
+fn reject_pending_requests(requests: &Receiver<SymbolizeRequest>, error: SymbolizeError) {
     while let Ok(request) = requests.try_recv() {
         let _ = request.reply.send(Err(error.clone()));
     }
@@ -460,10 +439,7 @@ impl WorkerBackend for KernelBlazeBackend {
     fn symbolize(&mut self, addr: u64) -> Result<Symbolized, SymbolizeError> {
         let symbolized = self
             .inner
-            .symbolize_single(
-                &self.source,
-                blazesym::symbolize::Input::AbsAddr(addr),
-            )
+            .symbolize_single(&self.source, blazesym::symbolize::Input::AbsAddr(addr))
             .map_err(map_blaze_error)?;
         blaze_to_symbolized(symbolized, addr)
     }
@@ -489,21 +465,17 @@ fn blaze_to_symbolized(
             name: format!("{}+0x{:x}", symbol.name, symbol.offset),
             source: blaze_confidence(&symbol),
         }),
-        blazesym::symbolize::Symbolized::Unknown(
-            blazesym::symbolize::Reason::MissingSyms,
-        ) => Err(SymbolizeError::NoSymbolFile),
-        blazesym::symbolize::Symbolized::Unknown(_) => {
-            Err(SymbolizeError::NotFound {
-                addr: format!("{addr:#x}"),
-            })
+        blazesym::symbolize::Symbolized::Unknown(blazesym::symbolize::Reason::MissingSyms) => {
+            Err(SymbolizeError::NoSymbolFile)
         }
+        blazesym::symbolize::Symbolized::Unknown(_) => Err(SymbolizeError::NotFound {
+            addr: format!("{addr:#x}"),
+        }),
     }
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn blaze_confidence(
-    symbol: &blazesym::symbolize::Sym<'_>,
-) -> introspect_schema::SymbolConfidence {
+fn blaze_confidence(symbol: &blazesym::symbolize::Sym<'_>) -> introspect_schema::SymbolConfidence {
     use introspect_schema::SymbolConfidence;
 
     if symbol.code_info.is_some() {
@@ -575,12 +547,8 @@ mod tests {
             blazesym::symbolize::source::Source::Kernel(
                 blazesym::symbolize::source::Kernel::default(),
             );
-        let _symbolize_single = || {
-            symbolizer.symbolize_single(
-                &source,
-                blazesym::symbolize::Input::AbsAddr(0_u64),
-            )
-        };
+        let _symbolize_single =
+            || symbolizer.symbolize_single(&source, blazesym::symbolize::Input::AbsAddr(0_u64));
 
         let symbol = blazesym::symbolize::Sym {
             name: Cow::Borrowed("schedule"),
@@ -592,26 +560,19 @@ mod tests {
             inlined: Box::new([]),
             _non_exhaustive: (),
         };
-        let converted = blaze_to_symbolized(
-            blazesym::symbolize::Symbolized::Sym(symbol),
-            0x1020,
-        )
-        .unwrap();
+        let converted =
+            blaze_to_symbolized(blazesym::symbolize::Symbolized::Sym(symbol), 0x1020).unwrap();
         assert_eq!(converted.name, "schedule+0x20");
         assert_eq!(converted.source, SymbolConfidence::Kallsyms);
 
         let error = blaze_to_symbolized(
-            blazesym::symbolize::Symbolized::Unknown(
-                blazesym::symbolize::Reason::MissingSyms,
-            ),
+            blazesym::symbolize::Symbolized::Unknown(blazesym::symbolize::Reason::MissingSyms),
             0x1020,
         )
         .unwrap_err();
         assert_eq!(error, SymbolizeError::NoSymbolFile);
         let error = blaze_to_symbolized(
-            blazesym::symbolize::Symbolized::Unknown(
-                blazesym::symbolize::Reason::UnknownAddr,
-            ),
+            blazesym::symbolize::Symbolized::Unknown(blazesym::symbolize::Reason::UnknownAddr),
             0x1020,
         )
         .unwrap_err();
@@ -640,22 +601,20 @@ mod tests {
     fn worker_success_with_thread_owned_non_send_backend() {
         let caller_thread = thread::current().id();
         let (factory_thread, factory_thread_rx) = mpsc::channel();
-        let (client, handle) = spawn_worker(
-            config(4, Duration::from_secs(1)),
-            move || {
-                let current = thread::current();
-                factory_thread
-                    .send((current.id(), current.name().map(str::to_owned)))
-                    .unwrap();
-                Ok(EchoBackend {
-                    _thread_owned: Rc::new(()),
-                })
-            },
-        )
+        let (client, handle) = spawn_worker(config(4, Duration::from_secs(1)), move || {
+            let current = thread::current();
+            factory_thread
+                .send((current.id(), current.name().map(str::to_owned)))
+                .unwrap();
+            Ok(EchoBackend {
+                _thread_owned: Rc::new(()),
+            })
+        })
         .unwrap();
 
-        let (backend_thread, backend_thread_name) =
-            factory_thread_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (backend_thread, backend_thread_name) = factory_thread_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
         assert_ne!(backend_thread, caller_thread);
         assert_eq!(backend_thread_name.as_deref(), Some("fovea-symbolizer"));
         let symbol = client.symbolize(7).unwrap();
@@ -670,9 +629,7 @@ mod tests {
     impl WorkerBackend for ErrorBackend {
         fn symbolize(&mut self, addr: u64) -> Result<Symbolized, SymbolizeError> {
             match addr {
-                1 => Err(SymbolizeError::NotFound {
-                    addr: "0x1".into(),
-                }),
+                1 => Err(SymbolizeError::NotFound { addr: "0x1".into() }),
                 2 => Err(SymbolizeError::Backend {
                     reason: "fixture backend".into(),
                 }),
@@ -684,14 +641,11 @@ mod tests {
     #[test]
     fn worker_preserves_not_found_backend_and_no_symbol_errors() {
         let (client, handle) =
-            spawn_worker(config(4, Duration::from_secs(1)), || Ok(ErrorBackend))
-                .unwrap();
+            spawn_worker(config(4, Duration::from_secs(1)), || Ok(ErrorBackend)).unwrap();
 
         assert_eq!(
             client.symbolize(1).unwrap_err(),
-            SymbolizeError::NotFound {
-                addr: "0x1".into()
-            }
+            SymbolizeError::NotFound { addr: "0x1".into() }
         );
         assert_eq!(
             client.symbolize(2).unwrap_err(),
@@ -728,15 +682,12 @@ mod tests {
     fn request_queue_has_exact_capacity_and_reports_saturation() {
         let (entered, entered_rx) = mpsc::channel();
         let (release, release_rx) = mpsc::channel();
-        let (client, handle) = spawn_worker(
-            config(2, Duration::from_secs(1)),
-            move || {
-                Ok(BlockingBackend {
-                    entered,
-                    release: release_rx,
-                })
-            },
-        )
+        let (client, handle) = spawn_worker(config(2, Duration::from_secs(1)), move || {
+            Ok(BlockingBackend {
+                entered,
+                release: release_rx,
+            })
+        })
         .unwrap();
 
         let active_client = client.clone();
@@ -759,10 +710,7 @@ mod tests {
                 reply: reply_3,
             })
             .unwrap();
-        assert_eq!(
-            client.symbolize(4).unwrap_err(),
-            SymbolizeError::QueueFull
-        );
+        assert_eq!(client.symbolize(4).unwrap_err(), SymbolizeError::QueueFull);
 
         release.send(()).unwrap();
         assert_eq!(active.join().unwrap().unwrap().name, "frame_1");
@@ -789,15 +737,12 @@ mod tests {
     fn zero_capacity_is_supported_as_a_rendezvous_queue() {
         let (entered, entered_rx) = mpsc::channel();
         let (release, release_rx) = mpsc::channel();
-        let (client, handle) = spawn_worker(
-            config(0, Duration::from_secs(1)),
-            move || {
-                Ok(BlockingBackend {
-                    entered,
-                    release: release_rx,
-                })
-            },
-        )
+        let (client, handle) = spawn_worker(config(0, Duration::from_secs(1)), move || {
+            Ok(BlockingBackend {
+                entered,
+                release: release_rx,
+            })
+        })
         .unwrap();
 
         let active_client = client.clone();
@@ -805,9 +750,7 @@ mod tests {
             let deadline = std::time::Instant::now() + Duration::from_secs(1);
             loop {
                 match active_client.symbolize(1) {
-                    Err(SymbolizeError::QueueFull)
-                        if std::time::Instant::now() < deadline =>
-                    {
+                    Err(SymbolizeError::QueueFull) if std::time::Instant::now() < deadline => {
                         thread::yield_now();
                     }
                     result => break result,
@@ -816,10 +759,7 @@ mod tests {
         });
         entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
-        assert_eq!(
-            client.symbolize(2).unwrap_err(),
-            SymbolizeError::QueueFull
-        );
+        assert_eq!(client.symbolize(2).unwrap_err(), SymbolizeError::QueueFull);
 
         release.send(()).unwrap();
         assert_eq!(active.join().unwrap().unwrap().name, "frame_1");
@@ -830,37 +770,28 @@ mod tests {
     fn request_timeout_is_distinct() {
         let (entered, entered_rx) = mpsc::channel();
         let (release, release_rx) = mpsc::channel();
-        let (client, handle) = spawn_worker(
-            config(1, Duration::from_millis(20)),
-            move || {
-                Ok(BlockingBackend {
-                    entered,
-                    release: release_rx,
-                })
-            },
-        )
+        let (client, handle) = spawn_worker(config(1, Duration::from_millis(20)), move || {
+            Ok(BlockingBackend {
+                entered,
+                release: release_rx,
+            })
+        })
         .unwrap();
 
         let caller = thread::spawn(move || client.symbolize(1));
         entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(
-            caller.join().unwrap().unwrap_err(),
-            SymbolizeError::Timeout
-        );
+        assert_eq!(caller.join().unwrap().unwrap_err(), SymbolizeError::Timeout);
         release.send(()).unwrap();
         handle.shutdown().unwrap();
     }
 
     #[test]
     fn clean_shutdown_stops_future_requests() {
-        let (client, handle) = spawn_worker(
-            config(2, Duration::from_secs(1)),
-            || {
-                Ok(EchoBackend {
-                    _thread_owned: Rc::new(()),
-                })
-            },
-        )
+        let (client, handle) = spawn_worker(config(2, Duration::from_secs(1)), || {
+            Ok(EchoBackend {
+                _thread_owned: Rc::new(()),
+            })
+        })
         .unwrap();
 
         handle.shutdown().unwrap();
@@ -896,16 +827,13 @@ mod tests {
         let (release, release_rx) = mpsc::channel();
         let calls = Arc::new(AtomicUsize::new(0));
         let backend_calls = Arc::clone(&calls);
-        let (client, handle) = spawn_worker(
-            config(2, Duration::from_secs(2)),
-            move || {
-                Ok(ShutdownRaceBackend {
-                    entered,
-                    release: release_rx,
-                    calls: backend_calls,
-                })
-            },
-        )
+        let (client, handle) = spawn_worker(config(2, Duration::from_secs(2)), move || {
+            Ok(ShutdownRaceBackend {
+                entered,
+                release: release_rx,
+                calls: backend_calls,
+            })
+        })
         .unwrap();
 
         let active_client = client.clone();
@@ -926,16 +854,11 @@ mod tests {
                 move || accepted.send(()).unwrap(),
             )
         });
-        before_send_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
+        before_send_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
         let lifecycle = Arc::clone(&client.lifecycle);
         let shutdown = thread::spawn(move || handle.shutdown());
-        assert!(lifecycle.wait_for_state(
-            WorkerState::ShutdownRequested,
-            Duration::from_secs(1)
-        ));
+        assert!(lifecycle.wait_for_state(WorkerState::ShutdownRequested, Duration::from_secs(1)));
 
         continue_send.send(()).unwrap();
         accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -961,8 +884,7 @@ mod tests {
     #[test]
     fn worker_panic_reaches_request_and_shutdown() {
         let (client, handle) =
-            spawn_worker(config(1, Duration::from_secs(1)), || Ok(PanicBackend))
-                .unwrap();
+            spawn_worker(config(1, Duration::from_secs(1)), || Ok(PanicBackend)).unwrap();
 
         assert_eq!(
             client.symbolize(1).unwrap_err(),
@@ -994,15 +916,12 @@ mod tests {
     fn active_backend_panic_reaches_already_queued_caller() {
         let (entered, entered_rx) = mpsc::channel();
         let (panic_now, panic_now_rx) = mpsc::channel();
-        let (client, handle) = spawn_worker(
-            config(2, Duration::from_secs(2)),
-            move || {
-                Ok(ControlledPanicBackend {
-                    entered,
-                    panic_now: panic_now_rx,
-                })
-            },
-        )
+        let (client, handle) = spawn_worker(config(2, Duration::from_secs(2)), move || {
+            Ok(ControlledPanicBackend {
+                entered,
+                panic_now: panic_now_rx,
+            })
+        })
         .unwrap();
 
         let active_client = client.clone();
@@ -1012,11 +931,7 @@ mod tests {
         let (accepted, accepted_rx) = mpsc::channel();
         let queued_client = client.clone();
         let queued = thread::spawn(move || {
-            queued_client.symbolize_inner(
-                2,
-                || {},
-                move || accepted.send(()).unwrap(),
-            )
+            queued_client.symbolize_inner(2, || {}, move || accepted.send(()).unwrap())
         });
         accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
@@ -1034,10 +949,9 @@ mod tests {
 
     #[test]
     fn initialization_failure_is_returned() {
-        match spawn_worker::<ErrorBackend, _>(
-            config(1, Duration::from_secs(1)),
-            || Err(SymbolizeError::NoSymbolFile),
-        ) {
+        match spawn_worker::<ErrorBackend, _>(config(1, Duration::from_secs(1)), || {
+            Err(SymbolizeError::NoSymbolFile)
+        }) {
             Err(error) => assert_eq!(error, SymbolizeError::NoSymbolFile),
             Ok(_) => panic!("backend initialization failure must abort spawn"),
         }
@@ -1045,10 +959,9 @@ mod tests {
 
     #[test]
     fn factory_panic_is_reported_as_worker_panic() {
-        match spawn_worker::<ErrorBackend, _>(
-            config(1, Duration::from_secs(1)),
-            || panic!("fixture factory panic"),
-        ) {
+        match spawn_worker::<ErrorBackend, _>(config(1, Duration::from_secs(1)), || {
+            panic!("fixture factory panic")
+        }) {
             Err(error) => assert_eq!(error, SymbolizeError::WorkerPanic),
             Ok(_) => panic!("backend factory panic must abort spawn"),
         }
@@ -1058,14 +971,11 @@ mod tests {
     fn cloned_clients_keep_concurrent_replies_correlated() {
         const CLIENTS: u64 = 24;
 
-        let (client, handle) = spawn_worker(
-            config(32, Duration::from_secs(2)),
-            || {
-                Ok(EchoBackend {
-                    _thread_owned: Rc::new(()),
-                })
-            },
-        )
+        let (client, handle) = spawn_worker(config(32, Duration::from_secs(2)), || {
+            Ok(EchoBackend {
+                _thread_owned: Rc::new(()),
+            })
+        })
         .unwrap();
         let barrier = Arc::new(Barrier::new(CLIENTS as usize + 1));
         let mut callers = Vec::new();

@@ -22,6 +22,7 @@ use introspect_schema::Level0;
 /// 一个 enum 比三个独立 channel 更贴合物理事实。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum Message {
     Request(Request),
     Response(Response),
@@ -54,7 +55,6 @@ pub struct Request {
 pub enum RequestBody {
     /// §10。`read` —— 无门（§13.8）。
     Introspect { pid: i32 },
-
     // TODO(M6): AttachProbe { probe: ProbeSpec } —— 副作用 `intervention` 一旦
     // 探针改返回值，read 不再纯；定为 `intervention`，走 §13.8 事前门。
     // TODO(M7): ConfigIntervention { probe_id: .., override: .. } —— `intervention`。
@@ -95,6 +95,7 @@ pub enum SideEffect {
 /// 靶机对宿主请求的回执。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum Response {
     Ok {
         req_id: Uuid,

@@ -20,10 +20,10 @@ pub mod proc_view;
 pub mod symbolize;
 
 pub use introspect::{introspect, introspect_with, introspect_with_inputs, IntrospectService};
+#[cfg(target_os = "linux")]
+pub use proc_source::LinuxProcSource;
 pub use proc_source::{
     CpuCounters, ProcError, ProcSnapshot, ProcSource, SampleClock, ThreadSampleClock,
 };
-#[cfg(target_os = "linux")]
-pub use proc_source::LinuxProcSource;
 
 pub use introspect_schema as schema;

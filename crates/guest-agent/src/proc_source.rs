@@ -234,10 +234,8 @@ mod linux {
 
     impl ProcSource for LinuxProcSource {
         fn snapshot(&self, pid: i32) -> Result<ProcSnapshot, ProcError> {
-            let (stat, system) = read_adjacent_cpu_pair(
-                || read_required_string(pid, "stat"),
-                read_system_cpu,
-            )?;
+            let (stat, system) =
+                read_adjacent_cpu_pair(|| read_required_string(pid, "stat"), read_system_cpu)?;
             let parsed_stat = parse_stat(&stat)?;
             let status = read_required_string(pid, "status")?;
             let maps = read_required_string(pid, "maps")?;
@@ -273,10 +271,8 @@ mod linux {
         }
 
         fn cpu_counters(&self, pid: i32) -> Result<CpuCounters, ProcError> {
-            let (stat, system) = read_adjacent_cpu_pair(
-                || read_required_string(pid, "stat"),
-                read_system_cpu,
-            )?;
+            let (stat, system) =
+                read_adjacent_cpu_pair(|| read_required_string(pid, "stat"), read_system_cpu)?;
             let stat = parse_stat(&stat)?;
             Ok(CpuCounters {
                 process_ticks: stat.process_ticks,
@@ -468,10 +464,7 @@ mod tests {
                 Error::new(ErrorKind::InvalidData, "invalid"),
                 ProcIoErrorClass::InvalidData,
             ),
-            (
-                Error::new(ErrorKind::Other, "unrelated"),
-                ProcIoErrorClass::Other,
-            ),
+            (Error::other("unrelated"), ProcIoErrorClass::Other),
         ] {
             assert_eq!(classify_proc_io(&error, ProcIoScope::Process), expected);
         }
