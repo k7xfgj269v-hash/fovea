@@ -490,15 +490,15 @@ mod tests {
         let back: Level0 = serde_json::from_str(&s).unwrap();
         assert_eq!(back.identity.pid, 42);
         assert_eq!(back.state.run_state, RunState::D);
-        assert!(matches!(
-            back.recent,
-            RecentEvents::RecorderOff
-        ));
+        assert!(matches!(back.recent, RecentEvents::RecorderOff));
         assert_eq!(back.cost_hint.token, 500);
         // 皇冠明珠体检：完整 maps 没出现在 JSON 里（只有 kind 聚合 + top-N）
         let json_val: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert!(json_val["mem_shape"]["histogram"].is_array());
-        assert!(json_val.get("maps_raw").is_none(), "完整 maps 不该出现在 Level0");
+        assert!(
+            json_val.get("maps_raw").is_none(),
+            "完整 maps 不该出现在 Level0"
+        );
     }
 
     #[test]

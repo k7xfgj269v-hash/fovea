@@ -7,19 +7,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use introspect_schema::{
-    ConfidenceSummary, CostHint, Handles, Hotspot, Identity, Level0, LowConfidenceField,
-    ProcState, RecentEvents, Resource, RunState, StackFrame, SymbolConfidence, Symbolized,
+    ConfidenceSummary, CostHint, Handles, Hotspot, Identity, Level0, LowConfidenceField, ProcState,
+    RecentEvents, Resource, RunState, StackFrame, SymbolConfidence, Symbolized,
 };
 
-use crate::proc_source::{
-    CpuCounters, ProcError, ProcSnapshot, ProcSource, SampleClock,
-};
-use crate::proc_view::{self, Stat, CMDLINE_SHORT_MAX, MEM_SHAPE_TOP_N};
-use crate::symbolize::Symbolizer;
-#[cfg(any(test, target_os = "linux"))]
-use crate::symbolize::FallbackSymbolizer;
 #[cfg(target_os = "linux")]
 use crate::proc_source::ThreadSampleClock;
+use crate::proc_source::{CpuCounters, ProcError, ProcSnapshot, ProcSource, SampleClock};
+use crate::proc_view::{self, Stat, CMDLINE_SHORT_MAX, MEM_SHAPE_TOP_N};
+#[cfg(any(test, target_os = "linux"))]
+use crate::symbolize::FallbackSymbolizer;
+use crate::symbolize::Symbolizer;
 
 pub const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -92,13 +90,7 @@ pub fn introspect_with(pid: i32, symbolizer: &dyn Symbolizer) -> Result<Level0, 
 
         let source = LinuxProcSource::new();
         let clock = ThreadSampleClock;
-        return introspect_from_ports(
-            &source,
-            symbolizer,
-            &clock,
-            DEFAULT_SAMPLE_INTERVAL,
-            pid,
-        );
+        return introspect_from_ports(&source, symbolizer, &clock, DEFAULT_SAMPLE_INTERVAL, pid);
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -205,11 +197,7 @@ fn sample_cpu(
     Ok(calculate_cpu_percent(start, end, logical_cpus))
 }
 
-fn calculate_cpu_percent(
-    start: CpuCounters,
-    end: CpuCounters,
-    logical_cpus: u32,
-) -> CpuSample {
+fn calculate_cpu_percent(start: CpuCounters, end: CpuCounters, logical_cpus: u32) -> CpuSample {
     let Some(process_delta) = end.process_ticks.checked_sub(start.process_ticks) else {
         return CpuSample::unavailable("CPU 短采样进程计数器回退");
     };
@@ -223,8 +211,7 @@ fn calculate_cpu_percent(
         return CpuSample::unavailable("CPU 短采样 logical_cpus 不可用");
     }
 
-    let pct_cpu =
-        process_delta as f64 / system_delta as f64 * logical_cpus as f64 * 100.0;
+    let pct_cpu = process_delta as f64 / system_delta as f64 * logical_cpus as f64 * 100.0;
     if !pct_cpu.is_finite() {
         return CpuSample::unavailable("CPU 短采样结果不是有限数");
     }
@@ -496,6 +483,7 @@ mod tests {
 
     const TEST_PROCESS_START_TIME_TICKS: u64 = 12_345;
 
+    #[allow(clippy::too_many_arguments)]
     fn stat_line(
         pid: i32,
         comm: &str,
@@ -594,12 +582,7 @@ mod tests {
         clock: Arc<dyn SampleClock>,
         interval: Duration,
     ) -> IntrospectService {
-        IntrospectService::new(
-            source,
-            Arc::new(FallbackSymbolizer),
-            clock,
-            interval,
-        )
+        IntrospectService::new(source, Arc::new(FallbackSymbolizer), clock, interval)
     }
 
     struct PermissionSnapshotSource;
@@ -616,15 +599,12 @@ mod tests {
 
     #[test]
     fn contract_complete_fake_snapshot_populates_level0_without_live_procfs() {
-        let mut snapshot =
-            base_snapshot(stat_line(42, "demo", "D", 100, 50, 2, 4_000_000, 25, 3));
-        snapshot.maps =
-            "7f0000000000-7f0000100000 rw-p 00000000 00:00 0 [heap]\n".into();
+        let mut snapshot = base_snapshot(stat_line(42, "demo", "D", 100, 50, 2, 4_000_000, 25, 3));
+        snapshot.maps = "7f0000000000-7f0000100000 rw-p 00000000 00:00 0 [heap]\n".into();
         snapshot.wchan = Some("futex_wait_queue_me\n".into());
         snapshot.cmdline = b"/usr/bin/demo\0--mode\0contract\0".to_vec();
         snapshot.fd_names = vec![".".into(), "..".into(), "0".into(), "1".into()];
-        snapshot.kernel_stack =
-            Some("[<0000000000000001>] futex_wait_queue_me+0x1/0x2\n".into());
+        snapshot.kernel_stack = Some("[<0000000000000001>] futex_wait_queue_me+0x1/0x2\n".into());
         let source = Arc::new(MockProcSource::new(
             snapshot,
             [Ok(cpu_counters(160, 1_100))],
@@ -643,7 +623,10 @@ mod tests {
             level0.identity.cgroup.as_deref(),
             Some("/user.slice/demo.scope")
         );
-        assert_eq!(level0.identity.cmdline.short, "/usr/bin/demo --mode contract");
+        assert_eq!(
+            level0.identity.cmdline.short,
+            "/usr/bin/demo --mode contract"
+        );
         assert_eq!(level0.identity.uid, 1000);
         assert_eq!(level0.state.run_state, RunState::D);
         assert_eq!(level0.state.nr_threads, 2);
@@ -669,19 +652,12 @@ mod tests {
             let mut snapshot =
                 base_snapshot(stat_line(42, "demo", "S", 0, 0, 1, 4096, rss_pages, 0));
             snapshot.page_size_bytes = page_size_bytes;
-            let source = Arc::new(MockProcSource::new(
-                snapshot,
-                [Ok(cpu_counters(0, 1_001))],
-            ));
-            service(
-                source,
-                Arc::new(RecordingClock::default()),
-                Duration::ZERO,
-            )
-            .introspect(42)
-            .unwrap()
-            .resource
-            .rss_bytes
+            let source = Arc::new(MockProcSource::new(snapshot, [Ok(cpu_counters(0, 1_001))]));
+            service(source, Arc::new(RecordingClock::default()), Duration::ZERO)
+                .introspect(42)
+                .unwrap()
+                .resource
+                .rss_bytes
         };
 
         assert_eq!(inspect(7, 4096), 7 * 4096);
@@ -703,11 +679,7 @@ mod tests {
             (cpu_counters(120, 1_200), 4, 40.0),
             (cpu_counters(180, 1_100), 4, 320.0),
         ] {
-            let sample = calculate_cpu_percent(
-                cpu_counters(100, 1_000),
-                end,
-                logical_cpus,
-            );
+            let sample = calculate_cpu_percent(cpu_counters(100, 1_000), end, logical_cpus);
 
             assert!(sample.low_confidence_reason.is_none());
             assert!(sample.pct_cpu.is_finite());
@@ -747,8 +719,7 @@ mod tests {
                 reason: "not a number".into(),
             },
         ] {
-            let snapshot =
-                base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4096, 1, 0));
+            let snapshot = base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4096, 1, 0));
             let source = Arc::new(MockProcSource::new(snapshot, [Err(source_error)]));
             let error = service(
                 source,
@@ -769,8 +740,7 @@ mod tests {
 
     #[test]
     fn contract_concurrent_services_keep_fake_sources_and_clocks_independent() {
-        let mut snapshot_a =
-            base_snapshot(stat_line(101, "alpha", "S", 10, 10, 1, 4096, 2, 0));
+        let mut snapshot_a = base_snapshot(stat_line(101, "alpha", "S", 10, 10, 1, 4096, 2, 0));
         snapshot_a.exe = Some("/usr/bin/alpha".into());
         snapshot_a.cgroup = Some("/alpha.scope".into());
         snapshot_a.logical_cpus = 2;
@@ -782,8 +752,7 @@ mod tests {
         let interval_a = Duration::from_millis(3);
         let service_a = service(source_a, clock_a.clone(), interval_a);
 
-        let mut snapshot_b =
-            base_snapshot(stat_line(202, "beta", "S", 150, 50, 1, 8192, 3, 1));
+        let mut snapshot_b = base_snapshot(stat_line(202, "beta", "S", 150, 50, 1, 8192, 3, 1));
         snapshot_b.exe = Some("/opt/beta".into());
         snapshot_b.cgroup = Some("/beta.scope".into());
         snapshot_b.system_cpu_ticks = 5_000;
@@ -825,10 +794,7 @@ mod tests {
             introspect(0),
             Err(ProcError::InvalidPid { pid: 0 })
         ));
-        assert!(matches!(
-            introspect(1),
-            Err(ProcError::UnsupportedPlatform)
-        ));
+        assert!(matches!(introspect(1), Err(ProcError::UnsupportedPlatform)));
         assert!(matches!(
             introspect_with(1, &FallbackSymbolizer),
             Err(ProcError::UnsupportedPlatform)
@@ -850,13 +816,7 @@ mod tests {
 7f002000d000-7f0020010000 rw-p 00005000 08:01 9999  /var/data/cache.db\n";
         let wchan = "futex_wait_queue_me\n";
         let cmdline: &[u8] = b"./demo\0--foo\0--bar\0";
-        let fds = vec![
-            ".".into(),
-            "..".into(),
-            "0".into(),
-            "1".into(),
-            "2".into(),
-        ];
+        let fds = vec![".".into(), "..".into(), "0".into(), "1".into(), "2".into()];
         let stack = "[<ffffffff81a2b3c4>] futex_wait_queue_me+0xabc/0x123\n\
                      [<ffffffff81a2b4d0>] __schedule+0x1a2/0x345\n";
 
@@ -914,8 +874,7 @@ mod tests {
 
     #[test]
     fn service_uses_runtime_page_size_identity_and_scaled_cpu_delta() {
-        let mut snapshot =
-            base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4_000_000, 25, 3));
+        let mut snapshot = base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4_000_000, 25, 3));
         snapshot.page_size_bytes = 16_384;
         let source = Arc::new(MockProcSource::new(
             snapshot,
@@ -948,8 +907,7 @@ mod tests {
         logical_cpus: u32,
         expected_reason: &str,
     ) {
-        let mut snapshot =
-            base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4096, 1, 0));
+        let mut snapshot = base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4096, 1, 0));
         snapshot.logical_cpus = logical_cpus;
         let source = Arc::new(MockProcSource::new(snapshot, [end]));
         let level0 = service(
@@ -975,32 +933,15 @@ mod tests {
 
     #[test]
     fn counter_rollbacks_zero_delta_and_invalid_cpu_count_are_low_confidence() {
-        assert_low_cpu_sample(
-            Ok(cpu_counters(149, 1_200)),
-            4,
-            "进程计数器回退",
-        );
-        assert_low_cpu_sample(
-            Ok(cpu_counters(170, 999)),
-            4,
-            "系统计数器回退",
-        );
-        assert_low_cpu_sample(
-            Ok(cpu_counters(170, 1_000)),
-            4,
-            "增量为 0",
-        );
-        assert_low_cpu_sample(
-            Ok(cpu_counters(170, 1_200)),
-            0,
-            "logical_cpus",
-        );
+        assert_low_cpu_sample(Ok(cpu_counters(149, 1_200)), 4, "进程计数器回退");
+        assert_low_cpu_sample(Ok(cpu_counters(170, 999)), 4, "系统计数器回退");
+        assert_low_cpu_sample(Ok(cpu_counters(170, 1_000)), 4, "增量为 0");
+        assert_low_cpu_sample(Ok(cpu_counters(170, 1_200)), 0, "logical_cpus");
     }
 
     #[test]
     fn process_disappearance_during_cpu_sample_is_fatal() {
-        let snapshot =
-            base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4096, 1, 0));
+        let snapshot = base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4096, 1, 0));
         let source = Arc::new(MockProcSource::new(
             snapshot,
             [Err(ProcError::ProcNotFound { pid: 42 })],
@@ -1017,8 +958,7 @@ mod tests {
 
     #[test]
     fn pid_generation_mismatch_is_fatal_even_with_monotonic_counters() {
-        let snapshot =
-            base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4096, 1, 0));
+        let snapshot = base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4096, 1, 0));
         let source = Arc::new(MockProcSource::new(
             snapshot,
             [Ok(CpuCounters {
@@ -1041,8 +981,7 @@ mod tests {
 
     #[test]
     fn matching_generation_preserves_cpu_percent() {
-        let snapshot =
-            base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4096, 1, 0));
+        let snapshot = base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4096, 1, 0));
         let source = Arc::new(MockProcSource::new(
             snapshot,
             [Ok(cpu_counters(170, 1_200))],
@@ -1092,8 +1031,7 @@ mod tests {
 
     #[test]
     fn zero_page_size_is_rejected_before_cpu_sampling() {
-        let mut snapshot =
-            base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4096, 1, 0));
+        let mut snapshot = base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4096, 1, 0));
         snapshot.page_size_bytes = 0;
         let clock = Arc::new(RecordingClock::default());
         let error = service(
@@ -1113,30 +1051,13 @@ mod tests {
 
     #[test]
     fn rss_conversion_saturates_at_u64_max() {
-        let mut snapshot = base_snapshot(stat_line(
-            42,
-            "demo",
-            "S",
-            0,
-            0,
-            1,
-            4096,
-            u64::MAX,
-            0,
-        ));
+        let mut snapshot = base_snapshot(stat_line(42, "demo", "S", 0, 0, 1, 4096, u64::MAX, 0));
         snapshot.page_size_bytes = 2;
-        let source = Arc::new(MockProcSource::new(
-            snapshot,
-            [Ok(cpu_counters(0, 1_001))],
-        ));
+        let source = Arc::new(MockProcSource::new(snapshot, [Ok(cpu_counters(0, 1_001))]));
 
-        let level0 = service(
-            source,
-            Arc::new(RecordingClock::default()),
-            Duration::ZERO,
-        )
-        .introspect(42)
-        .unwrap();
+        let level0 = service(source, Arc::new(RecordingClock::default()), Duration::ZERO)
+            .introspect(42)
+            .unwrap();
         assert_eq!(level0.resource.rss_bytes, u64::MAX);
     }
 
@@ -1189,8 +1110,7 @@ mod tests {
             assert_eq!(cmdline.full_len, joined.len());
             assert_eq!(
                 cmdline.short.chars().count(),
-                scalar_count.min(CMDLINE_SHORT_MAX)
-                    + usize::from(scalar_count > CMDLINE_SHORT_MAX)
+                scalar_count.min(CMDLINE_SHORT_MAX) + usize::from(scalar_count > CMDLINE_SHORT_MAX)
             );
         }
     }
