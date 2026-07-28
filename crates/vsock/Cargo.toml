@@ -16,5 +16,8 @@ chrono.workspace = true
 tokio.workspace = true
 introspect-schema.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

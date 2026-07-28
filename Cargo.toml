@@ -26,6 +26,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # 异步运行时（控制面用，数据面 introspect 本身保持同步可单测）
 tokio = { version = "1", features = ["full"] }
+# Linux virtio-vsock adapter
+tokio-vsock = "=0.7.2"
 # 异步 trait
 async-trait = "0.1"
 # 时间
