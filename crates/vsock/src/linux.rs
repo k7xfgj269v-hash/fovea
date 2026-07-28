@@ -1,10 +1,19 @@
 //! Linux virtio-vsock adapters for the directional transport ports.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    io,
+    net::Shutdown,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex,
+    },
+    task::{Context, Poll},
+};
 
 use async_trait::async_trait;
 use tokio::{
-    io::{split, BufReader, ReadHalf, WriteHalf},
+    io::{AsyncRead, AsyncWrite, BufReader, ReadBuf},
     sync::Mutex,
 };
 use tokio_vsock::{VsockAddr, VsockListener, VsockStream};
@@ -105,64 +114,172 @@ impl GuestEndpoint for GuestVsockEndpoint {
     }
 }
 
-type VsockReader = BufReader<ReadHalf<VsockStream>>;
-type VsockWriter = WriteHalf<VsockStream>;
+#[derive(Clone)]
+struct SharedVsockStream {
+    inner: Arc<StdMutex<VsockStream>>,
+}
+
+impl SharedVsockStream {
+    fn new(stream: VsockStream) -> Self {
+        Self {
+            inner: Arc::new(StdMutex::new(stream)),
+        }
+    }
+
+    fn lock(&self) -> io::Result<std::sync::MutexGuard<'_, VsockStream>> {
+        self.inner
+            .lock()
+            .map_err(|_| io::Error::other("vsock stream mutex poisoned"))
+    }
+}
+
+impl AsyncRead for SharedVsockStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.lock() {
+            Ok(mut stream) => Pin::new(&mut *stream).poll_read(cx, buffer),
+            Err(error) => Poll::Ready(Err(error)),
+        }
+    }
+}
+
+impl AsyncWrite for SharedVsockStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.lock() {
+            Ok(mut stream) => Pin::new(&mut *stream).poll_write(cx, buffer),
+            Err(error) => Poll::Ready(Err(error)),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.lock() {
+            Ok(mut stream) => Pin::new(&mut *stream).poll_flush(cx),
+            Err(error) => Poll::Ready(Err(error)),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.lock() {
+            Ok(mut stream) => Pin::new(&mut *stream).poll_shutdown(cx),
+            Err(error) => Poll::Ready(Err(error)),
+        }
+    }
+}
+
+trait ShutdownBoth {
+    fn shutdown_both(&self) -> io::Result<()>;
+}
+
+impl ShutdownBoth for SharedVsockStream {
+    fn shutdown_both(&self) -> io::Result<()> {
+        self.lock()?.shutdown(Shutdown::Both)
+    }
+}
+
+struct TerminalClose<S> {
+    closed: AtomicBool,
+    shutdown: S,
+}
+
+impl<S> TerminalClose<S>
+where
+    S: ShutdownBoth,
+{
+    fn new(shutdown: S) -> Self {
+        Self {
+            closed: AtomicBool::new(false),
+            shutdown,
+        }
+    }
+
+    fn ensure_open(&self) -> Result<(), TransportError> {
+        if self.closed.load(Ordering::Acquire) {
+            Err(TransportError::PeerClosed)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn finish<T>(&self, result: Result<T, TransportError>) -> Result<T, TransportError> {
+        match result {
+            Ok(value) => {
+                self.ensure_open()?;
+                Ok(value)
+            }
+            Err(error) => {
+                if self
+                    .closed
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    let _ = self.shutdown.shutdown_both();
+                    Err(error)
+                } else {
+                    Err(TransportError::PeerClosed)
+                }
+            }
+        }
+    }
+}
+
+type VsockReader = BufReader<SharedVsockStream>;
+type VsockWriter = SharedVsockStream;
 
 struct EndpointIo {
     reader: Mutex<VsockReader>,
     writer: Mutex<VsockWriter>,
     codec: JsonLinesCodec,
-    closed: AtomicBool,
+    terminal: TerminalClose<SharedVsockStream>,
 }
 
 impl EndpointIo {
     fn new(stream: VsockStream, max_frame: usize) -> Self {
-        let (reader, writer) = split(stream);
+        let stream = SharedVsockStream::new(stream);
 
         Self {
-            reader: Mutex::new(BufReader::new(reader)),
-            writer: Mutex::new(writer),
+            reader: Mutex::new(BufReader::new(stream.clone())),
+            writer: Mutex::new(stream.clone()),
             codec: JsonLinesCodec::new(max_frame),
-            closed: AtomicBool::new(false),
+            terminal: TerminalClose::new(stream),
         }
     }
 
     async fn read_host_to_guest(&self) -> Result<HostToGuest, TransportError> {
-        ensure_open(&self.closed)?;
+        self.terminal.ensure_open()?;
         let mut reader = self.reader.lock().await;
-        ensure_open(&self.closed)?;
-        close_on_error(
-            &self.closed,
-            self.codec.read_host_to_guest(&mut *reader).await,
-        )
+        self.terminal.ensure_open()?;
+        self.terminal
+            .finish(self.codec.read_host_to_guest(&mut *reader).await)
     }
 
     async fn read_guest_to_host(&self) -> Result<GuestToHost, TransportError> {
-        ensure_open(&self.closed)?;
+        self.terminal.ensure_open()?;
         let mut reader = self.reader.lock().await;
-        ensure_open(&self.closed)?;
-        close_on_error(
-            &self.closed,
-            self.codec.read_guest_to_host(&mut *reader).await,
-        )
+        self.terminal.ensure_open()?;
+        self.terminal
+            .finish(self.codec.read_guest_to_host(&mut *reader).await)
     }
 
     async fn write_host_to_guest(&self, message: &HostToGuest) -> Result<(), TransportError> {
-        ensure_open(&self.closed)?;
+        self.terminal.ensure_open()?;
         let mut writer = self.writer.lock().await;
-        ensure_open(&self.closed)?;
-        close_on_error(
-            &self.closed,
-            self.codec.write_host_to_guest(&mut *writer, message).await,
-        )
+        self.terminal.ensure_open()?;
+        self.terminal
+            .finish(self.codec.write_host_to_guest(&mut *writer, message).await)
     }
 
     async fn write_guest_to_host(&self, message: &GuestToHost) -> Result<(), TransportError> {
-        ensure_open(&self.closed)?;
+        self.terminal.ensure_open()?;
         let mut writer = self.writer.lock().await;
-        ensure_open(&self.closed)?;
-        close_on_error(
-            &self.closed,
+        self.terminal.ensure_open()?;
+        self.terminal.finish(
             self.codec
                 .write_guest_to_host(&mut *writer, message)
                 .await,
@@ -170,27 +287,25 @@ impl EndpointIo {
     }
 }
 
-fn ensure_open(closed: &AtomicBool) -> Result<(), TransportError> {
-    if closed.load(Ordering::Acquire) {
-        Err(TransportError::PeerClosed)
-    } else {
-        Ok(())
-    }
-}
-
-fn close_on_error<T>(
-    closed: &AtomicBool,
-    result: Result<T, TransportError>,
-) -> Result<T, TransportError> {
-    if result.is_err() {
-        closed.store(true, Ordering::Release);
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::watch;
+
+    #[derive(Clone)]
+    struct TestShutdown {
+        calls: Arc<AtomicUsize>,
+        closed: watch::Sender<bool>,
+    }
+
+    impl ShutdownBoth for TestShutdown {
+        fn shutdown_both(&self) -> io::Result<()> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.closed.send_replace(true);
+            Ok(())
+        }
+    }
 
     #[test]
     fn endpoint_config_preserves_cid_and_port() {
@@ -203,20 +318,46 @@ mod tests {
         assert_eq!(endpoint.port, 9000);
     }
 
-    #[test]
-    fn terminal_error_makes_future_operations_peer_closed() {
-        let closed = AtomicBool::new(false);
-        let error = close_on_error::<()>(&closed, Err(TransportError::InvalidUtf8)).unwrap_err();
+    #[tokio::test]
+    async fn terminal_error_physically_closes_and_wakes_opposite_direction() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (closed, mut closed_rx) = watch::channel(false);
+        let terminal = Arc::new(TerminalClose::new(TestShutdown {
+            calls: Arc::clone(&calls),
+            closed,
+        }));
+        let opposite_terminal = Arc::clone(&terminal);
+        let opposite = tokio::spawn(async move {
+            while !*closed_rx.borrow() {
+                closed_rx.changed().await.unwrap();
+            }
+            opposite_terminal
+                .finish::<()>(Err(TransportError::Io {
+                    msg: "woken opposite direction".to_owned(),
+                }))
+                .unwrap_err()
+        });
 
+        let error = terminal
+            .finish::<()>(Err(TransportError::InvalidUtf8))
+            .unwrap_err();
         assert_eq!(error, TransportError::InvalidUtf8);
-        assert_eq!(ensure_open(&closed), Err(TransportError::PeerClosed));
+        assert_eq!(opposite.await.unwrap(), TransportError::PeerClosed);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(terminal.ensure_open(), Err(TransportError::PeerClosed));
     }
 
     #[test]
     fn successful_operation_keeps_connection_open() {
-        let closed = AtomicBool::new(false);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (closed, _) = watch::channel(false);
+        let terminal = TerminalClose::new(TestShutdown {
+            calls: Arc::clone(&calls),
+            closed,
+        });
 
-        assert_eq!(close_on_error(&closed, Ok(7)), Ok(7));
-        assert_eq!(ensure_open(&closed), Ok(()));
+        assert_eq!(terminal.finish(Ok(7)), Ok(7));
+        assert_eq!(terminal.ensure_open(), Ok(()));
+        assert_eq!(calls.load(Ordering::Acquire), 0);
     }
 }

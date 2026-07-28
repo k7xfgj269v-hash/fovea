@@ -17,6 +17,36 @@ pub struct JsonLinesCodec {
     max_frame_bytes: usize,
 }
 
+struct OwnedFrame {
+    storage: Box<[u8]>,
+    len: usize,
+}
+
+impl OwnedFrame {
+    fn new(storage_len: usize) -> Self {
+        Self {
+            storage: vec![0; storage_len].into_boxed_slice(),
+            len: 0,
+        }
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        let end = self.len + bytes.len();
+        self.storage[self.len..end].copy_from_slice(bytes);
+        self.len = end;
+    }
+
+    fn strip_trailing_cr(&mut self) {
+        if self.as_slice().last() == Some(&b'\r') {
+            self.len -= 1;
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.storage[..self.len]
+    }
+}
+
 impl JsonLinesCodec {
     /// Construct a codec with the given maximum JSON payload size.
     pub const fn new(max_frame_bytes: usize) -> Self {
@@ -77,7 +107,8 @@ impl JsonLinesCodec {
         R: AsyncBufRead + Unpin,
     {
         let frame = self.read_frame(reader).await?;
-        let text = std::str::from_utf8(&frame).map_err(|_| TransportError::InvalidUtf8)?;
+        let text =
+            std::str::from_utf8(frame.as_slice()).map_err(|_| TransportError::InvalidUtf8)?;
 
         match serde_json::from_str(text) {
             Ok(message) => Ok(message),
@@ -94,17 +125,20 @@ impl JsonLinesCodec {
         }
     }
 
-    async fn read_frame<R>(&self, reader: &mut R) -> Result<Vec<u8>, TransportError>
+    async fn read_frame<R>(&self, reader: &mut R) -> Result<OwnedFrame, TransportError>
     where
         R: AsyncBufRead + Unpin,
     {
-        let owned_limit = self.max_frame_bytes.saturating_add(1);
-        let mut frame = Vec::new();
+        let owned_limit = self
+            .max_frame_bytes
+            .checked_add(1)
+            .ok_or_else(|| self.frame_too_large())?;
+        let mut frame = OwnedFrame::new(owned_limit);
 
         loop {
             let available = reader.fill_buf().await.map_err(TransportError::io)?;
             if available.is_empty() {
-                return if frame.is_empty() {
+                return if frame.len == 0 {
                     Err(TransportError::PeerClosed)
                 } else {
                     Err(TransportError::TruncatedFrame)
@@ -112,22 +146,20 @@ impl JsonLinesCodec {
             }
 
             if let Some(newline_index) = available.iter().position(|byte| *byte == b'\n') {
-                let total_before_newline = frame.len().saturating_add(newline_index);
-                let copy_len = newline_index.min(owned_limit.saturating_sub(frame.len()));
-                frame.extend_from_slice(&available[..copy_len]);
+                let total_before_newline = frame.len.saturating_add(newline_index);
+                let copy_len = newline_index.min(owned_limit.saturating_sub(frame.len));
+                frame.append(&available[..copy_len]);
                 reader.consume(newline_index + 1);
 
                 if total_before_newline > owned_limit {
                     return Err(self.frame_too_large());
                 }
 
-                if frame.last() == Some(&b'\r') {
-                    frame.pop();
-                }
-                if frame.len() > self.max_frame_bytes {
+                frame.strip_trailing_cr();
+                if frame.len > self.max_frame_bytes {
                     return Err(self.frame_too_large());
                 }
-                if frame.is_empty() {
+                if frame.len == 0 {
                     return Err(TransportError::EmptyFrame);
                 }
 
@@ -135,15 +167,15 @@ impl JsonLinesCodec {
             }
 
             let available_len = available.len();
-            let remaining = owned_limit.saturating_sub(frame.len());
+            let remaining = owned_limit.saturating_sub(frame.len);
             if available_len > remaining {
                 return Err(self.frame_too_large());
             }
 
-            frame.extend_from_slice(available);
+            frame.append(available);
             reader.consume(available_len);
 
-            if frame.len() == owned_limit && frame.last() != Some(&b'\r') {
+            if frame.len == owned_limit && frame.as_slice().last() != Some(&b'\r') {
                 return Err(self.frame_too_large());
             }
         }
@@ -289,6 +321,27 @@ mod tests {
 
         assert_eq!(
             codec.read_host_to_guest(&mut reader).await.unwrap(),
+            message
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_limit_crlf_one_byte_chunks_use_fixed_storage() {
+        let message = request(12);
+        let encoded = serde_json::to_vec(&message).unwrap();
+        let codec = JsonLinesCodec::new(encoded.len());
+        let (mut writer, reader) = duplex(encoded.len() + 2);
+        let mut reader = BufReader::with_capacity(1, reader);
+
+        writer.write_all(&encoded).await.unwrap();
+        writer.write_all(b"\r\n").await.unwrap();
+
+        let frame = codec.read_frame(&mut reader).await.unwrap();
+        assert_eq!(frame.storage.len(), encoded.len() + 1);
+        assert_eq!(frame.len, encoded.len());
+        assert_eq!(frame.as_slice(), encoded);
+        assert_eq!(
+            serde_json::from_slice::<HostToGuest>(frame.as_slice()).unwrap(),
             message
         );
     }
