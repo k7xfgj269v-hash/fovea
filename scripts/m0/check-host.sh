@@ -60,6 +60,8 @@ require_unused_path() {
     local path=$2
     local parent
 
+    unused_path_canonical=
+
     [[ -n "$path" ]] || die "$label path is empty"
     [[ "$path" != *$'\n'* ]] || die "$label path contains a newline"
     if [[ -e "$path" || -L "$path" ]]; then
@@ -67,8 +69,88 @@ require_unused_path() {
     fi
 
     parent=$(dirname -- "$path")
-    [[ -d "$parent" ]] || die "$label parent directory does not exist: $parent"
-    [[ -w "$parent" ]] || die "$label parent directory is not writable: $parent"
+    [[ -e "$parent" || -L "$parent" ]] ||
+        die "$label parent directory does not exist: $parent"
+    if ! unused_path_canonical=$("$PYTHON_BIN" - "$label" "$parent" "$path" <<'PY'
+import os
+import signal
+import stat
+import sys
+
+label, parent, target = sys.argv[1:4]
+
+
+def reject(message):
+    print(f"check-host: {label} {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def handle_timeout(_signum, _frame):
+    reject(f"parent directory check timed out: {parent}")
+
+
+signal.signal(signal.SIGALRM, handle_timeout)
+signal.alarm(5)
+
+try:
+    parent_stat = os.lstat(parent)
+except OSError as exc:
+    reject(f"parent directory cannot be inspected: {parent}: {exc}")
+
+if stat.S_ISLNK(parent_stat.st_mode):
+    reject(f"parent directory is a symlink: {parent}")
+if not stat.S_ISDIR(parent_stat.st_mode):
+    reject(f"parent path is not a directory: {parent}")
+
+try:
+    canonical_parent = os.path.realpath(parent)
+    canonical_stat = os.lstat(canonical_parent)
+except OSError as exc:
+    reject(f"canonical parent directory cannot be inspected: {parent}: {exc}")
+
+if stat.S_ISLNK(canonical_stat.st_mode):
+    reject(f"canonical parent directory is a symlink: {canonical_parent}")
+if not stat.S_ISDIR(canonical_stat.st_mode):
+    reject(f"canonical parent path is not a directory: {canonical_parent}")
+
+for checked_path, checked_stat in (
+    (parent, parent_stat),
+    (canonical_parent, canonical_stat),
+):
+    if checked_stat.st_uid != os.getuid():
+        reject(
+            f"parent directory is not owned by the invoking user: "
+            f"{checked_path}"
+        )
+    if stat.S_IMODE(checked_stat.st_mode) != 0o700:
+        reject(f"parent directory must have mode 700: {checked_path}")
+    if not os.access(checked_path, os.W_OK):
+        reject(f"parent directory is not writable: {checked_path}")
+    if not os.access(checked_path, os.X_OK):
+        reject(
+            f"parent directory is not searchable/executable: "
+            f"{checked_path}"
+        )
+
+try:
+    if os.path.lexists(target):
+        reject(f"path already exists: {target}")
+except OSError as exc:
+    reject(f"path cannot be inspected: {target}: {exc}")
+
+target_name = os.path.basename(target)
+if not target_name:
+    reject(f"path has no target name: {target}")
+
+canonical_target = os.path.realpath(
+    os.path.join(canonical_parent, target_name)
+)
+signal.alarm(0)
+print(canonical_target)
+PY
+    ); then
+        die "$label parent directory security check failed: $parent"
+    fi
 }
 
 qmp_socket=/tmp/fovea-m0.qmp.sock
@@ -181,7 +263,12 @@ fi
 [[ "$qmp_socket" != *,* ]] ||
     die "QMP socket path cannot contain a comma"
 require_unused_path "QMP socket" "$qmp_socket"
+qmp_socket_canonical=$unused_path_canonical
 require_unused_path pidfile "$pidfile"
+pidfile_canonical=$unused_path_canonical
+
+[[ "$qmp_socket_canonical" != "$pidfile_canonical" ]] ||
+    die "QMP socket and pidfile paths resolve to the same canonical path: $qmp_socket_canonical"
 
 if ! "$PYTHON_BIN" - "$gdb_port" <<'PY'
 import socket
