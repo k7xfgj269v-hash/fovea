@@ -11,6 +11,10 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::model::{GuestToHost, HostToGuest};
 
+pub mod codec;
+#[cfg(target_os = "linux")]
+#[rustfmt::skip]
+pub mod linux;
 pub mod model;
 
 /// vsock 上的传输失败。
@@ -19,14 +23,14 @@ pub mod model;
 /// 别让一个模糊的 `io::Error` 把「靶机被 AI 接管了」这种事实吞掉。
 #[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
 pub enum TransportError {
-    #[error("对端在传输中途关闭连接")]
+    #[error("对端已关闭连接")]
     PeerClosed,
-    #[error("JSON 行解析失败：{msg}")]
-    Decode { msg: String },
+    #[error("底层 I/O：{msg}")]
+    Io { msg: String },
     #[error("JSON 序列化失败：{msg}")]
     Encode { msg: String },
-    #[error("底层 I/O：{0}")]
-    Io(String),
+    #[error("JSON 帧解码失败：{msg}")]
+    MalformedDecode { msg: String },
     #[error("帧不是有效 UTF-8")]
     InvalidUtf8,
     #[error("帧超过 {max_frame_bytes} 字节上限")]
@@ -40,13 +44,25 @@ pub enum TransportError {
 }
 
 impl TransportError {
-    /// 从 [`serde_json::Error`] 构造 Decode（in 路径）。
-    pub fn decode(e: serde_json::Error) -> Self {
-        TransportError::Decode { msg: e.to_string() }
+    /// 从 [`std::io::Error`] 构造底层 I/O 错误。
+    pub fn io(error: std::io::Error) -> Self {
+        TransportError::Io {
+            msg: error.to_string(),
+        }
     }
-    /// 从 [`serde_json::Error`] 构造 Encode（out 路径）。
-    pub fn encode(e: serde_json::Error) -> Self {
-        TransportError::Encode { msg: e.to_string() }
+
+    /// 从 [`serde_json::Error`] 构造 malformed decode（in 路径）。
+    pub fn malformed_decode(error: serde_json::Error) -> Self {
+        TransportError::MalformedDecode {
+            msg: error.to_string(),
+        }
+    }
+
+    /// 从 [`serde_json::Error`] 构造 encode（out 路径）。
+    pub fn encode(error: serde_json::Error) -> Self {
+        TransportError::Encode {
+            msg: error.to_string(),
+        }
     }
 }
 
