@@ -290,7 +290,7 @@ impl EndpointIo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::{atomic::AtomicUsize, Barrier};
     use tokio::sync::watch;
 
     #[derive(Clone)]
@@ -343,6 +343,48 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, TransportError::InvalidUtf8);
         assert_eq!(opposite.await.unwrap(), TransportError::PeerClosed);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(terminal.ensure_open(), Err(TransportError::PeerClosed));
+    }
+
+    #[test]
+    fn racing_terminal_errors_shutdown_once_and_preserve_only_winner() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (closed, _) = watch::channel(false);
+        let terminal = Arc::new(TerminalClose::new(TestShutdown {
+            calls: Arc::clone(&calls),
+            closed,
+        }));
+        let barrier = Arc::new(Barrier::new(3));
+
+        let left_terminal = Arc::clone(&terminal);
+        let left_barrier = Arc::clone(&barrier);
+        let left = std::thread::spawn(move || {
+            left_barrier.wait();
+            left_terminal
+                .finish::<()>(Err(TransportError::InvalidUtf8))
+                .unwrap_err()
+        });
+
+        let right_terminal = Arc::clone(&terminal);
+        let right_barrier = Arc::clone(&barrier);
+        let right = std::thread::spawn(move || {
+            right_barrier.wait();
+            right_terminal
+                .finish::<()>(Err(TransportError::TruncatedFrame))
+                .unwrap_err()
+        });
+
+        barrier.wait();
+        let left_error = left.join().unwrap();
+        let right_error = right.join().unwrap();
+
+        assert!(
+            (left_error == TransportError::InvalidUtf8
+                && right_error == TransportError::PeerClosed)
+                || (left_error == TransportError::PeerClosed
+                    && right_error == TransportError::TruncatedFrame)
+        );
         assert_eq!(calls.load(Ordering::Acquire), 1);
         assert_eq!(terminal.ensure_open(), Err(TransportError::PeerClosed));
     }
