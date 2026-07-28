@@ -44,6 +44,177 @@ require_readable_file() {
         die "$label must be a readable regular file: $path"
 }
 
+canonicalize_path() {
+    "$PYTHON_BIN" - "$1" <<'PY'
+import os
+import sys
+
+print(os.path.realpath(sys.argv[1]))
+PY
+}
+
+canonicalize_disk() {
+    "$PYTHON_BIN" - "$1" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+
+
+def reject(message):
+    print(f"run-vm: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+try:
+    disk_stat = os.lstat(path)
+except OSError as exc:
+    reject(f"disk cannot be inspected: {path}: {exc}")
+
+if stat.S_ISLNK(disk_stat.st_mode):
+    reject(f"disk must not be a symlink: {path}")
+if not stat.S_ISREG(disk_stat.st_mode):
+    reject(f"disk must be a readable regular file: {path}")
+if not os.access(path, os.R_OK):
+    reject(f"disk must be a readable regular file: {path}")
+
+canonical = os.path.realpath(path)
+try:
+    canonical_stat = os.stat(canonical)
+except OSError as exc:
+    reject(f"canonical disk cannot be inspected: {canonical}: {exc}")
+
+if not stat.S_ISREG(canonical_stat.st_mode):
+    reject(f"canonical disk must be a readable regular file: {canonical}")
+if not os.access(canonical, os.R_OK):
+    reject(f"canonical disk must be a readable regular file: {canonical}")
+
+parent = os.path.dirname(canonical)
+try:
+    parent_stat = os.lstat(parent)
+except OSError as exc:
+    reject(f"disk parent directory cannot be inspected: {parent}: {exc}")
+
+if stat.S_ISLNK(parent_stat.st_mode):
+    reject(f"disk parent directory is a symlink: {parent}")
+if not stat.S_ISDIR(parent_stat.st_mode):
+    reject(f"disk parent path is not a directory: {parent}")
+if stat.S_IMODE(parent_stat.st_mode) & 0o022:
+    reject(f"disk parent directory must not be group/other writable: {parent}")
+
+print(canonical)
+print(f"{canonical_stat.st_dev:x}-{canonical_stat.st_ino:x}")
+PY
+}
+
+ensure_global_lock_root() {
+    local root=$1
+
+    if [[ ! -e "$root" && ! -L "$root" ]]; then
+        if ! (umask 077 && mkdir -- "$root") 2>/dev/null; then
+            [[ -e "$root" || -L "$root" ]] ||
+                die "failed to create global launch lock root: $root"
+        fi
+    fi
+
+    "$PYTHON_BIN" - "$root" <<'PY' || \
+        die "global launch lock root security check failed: $root"
+import os
+import stat
+import sys
+
+root = sys.argv[1]
+
+
+def reject(message):
+    print(f"run-vm: global launch lock root {message}: {root}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+try:
+    root_stat = os.lstat(root)
+except OSError as exc:
+    reject(f"cannot be inspected ({exc})")
+
+if stat.S_ISLNK(root_stat.st_mode):
+    reject("must not be a symlink")
+if not stat.S_ISDIR(root_stat.st_mode):
+    reject("must be a directory")
+if root_stat.st_uid != os.getuid():
+    reject("must be owned by the invoking user")
+if stat.S_IMODE(root_stat.st_mode) != 0o700:
+    reject("must have mode 700")
+PY
+}
+
+release_launch_locks() {
+    local index
+    local lock_path
+
+    index=${#launch_locks[@]}
+    while ((index > 0)); do
+        index=$((index - 1))
+        lock_path=${launch_locks[$index]}
+        if ! rmdir -- "$lock_path"; then
+            printf 'run-vm: failed to release launch reservation: %s\n' \
+                "$lock_path" >&2
+        fi
+    done
+    launch_locks=()
+}
+
+cleanup_on_exit() {
+    local status=$?
+
+    trap - EXIT TERM INT
+    if [[ -n "$qemu_pid" ]]; then
+        if kill -0 "$qemu_pid" >/dev/null 2>&1; then
+            kill -TERM "$qemu_pid" >/dev/null 2>&1 || true
+        fi
+        wait "$qemu_pid" >/dev/null 2>&1 || true
+        qemu_pid=
+    fi
+    release_launch_locks
+    exit "$status"
+}
+
+forward_signal() {
+    local signal_name=$1
+    local fallback_status=$2
+    local child_status=$fallback_status
+
+    trap - TERM INT
+    if [[ -n "$qemu_pid" ]]; then
+        if kill -0 "$qemu_pid" >/dev/null 2>&1; then
+            kill "-$signal_name" "$qemu_pid" >/dev/null 2>&1 || true
+        fi
+        if wait "$qemu_pid"; then
+            child_status=0
+        else
+            child_status=$?
+        fi
+        qemu_pid=
+    fi
+    release_launch_locks
+    trap - EXIT
+    exit "$child_status"
+}
+
+acquire_launch_lock() {
+    local lock_path=$1
+    local diagnostic_path=${2:-$1}
+
+    if (umask 077 && mkdir -- "$lock_path") 2>/dev/null; then
+        launch_locks[${#launch_locks[@]}]=$lock_path
+        return
+    fi
+    if [[ -e "$lock_path" || -L "$lock_path" ]]; then
+        die "launch resources are already reserved: $diagnostic_path"
+    fi
+    die "failed to reserve launch resources: $diagnostic_path"
+}
+
 kernel=
 initrd=
 disk=
@@ -55,6 +226,8 @@ memory_mib=2048
 cpus=2
 dry_run=0
 append_parts=()
+launch_locks=()
+qemu_pid=
 
 while (($# > 0)); do
     case "$1" in
@@ -135,11 +308,16 @@ if [[ -n "$initrd" ]]; then
     require_readable_file initrd "$initrd"
 fi
 if [[ -n "$disk" ]]; then
+    [[ ! -L "$disk" ]] || die "disk must not be a symlink: $disk"
     require_readable_file disk "$disk"
+    [[ "$disk" != *$'\n'* ]] || die "disk path contains a newline"
     [[ "$disk" != *,* ]] || die "disk path cannot contain a comma"
 fi
 
-"$SCRIPT_DIR/check-host.sh" \
+QEMU_BIN=${QEMU_BIN:-qemu-system-x86_64}
+PYTHON_BIN=${PYTHON_BIN:-python3}
+
+QEMU_BIN="$QEMU_BIN" PYTHON_BIN="$PYTHON_BIN" "$SCRIPT_DIR/check-host.sh" \
     --qmp-socket "$qmp_socket" \
     --pidfile "$pidfile" \
     --gdb-port "$gdb_port" \
@@ -147,7 +325,38 @@ fi
     --memory-mib "$memory_mib" \
     --cpus "$cpus" >/dev/null
 
-QEMU_BIN=${QEMU_BIN:-qemu-system-x86_64}
+qmp_socket_canonical=$(canonicalize_path "$qmp_socket") ||
+    die "failed to canonicalize QMP socket path: $qmp_socket"
+pidfile_canonical=$(canonicalize_path "$pidfile") ||
+    die "failed to canonicalize pidfile path: $pidfile"
+[[ "$qmp_socket_canonical" != *,* ]] ||
+    die "QMP socket path cannot contain a comma"
+
+if [[ -n "$disk" ]]; then
+    disk_metadata=$(canonicalize_disk "$disk") ||
+        die "disk security check failed: $disk"
+    [[ "$disk_metadata" == *$'\n'* ]] ||
+        die "disk security check did not return canonical identity: $disk"
+    disk_canonical=${disk_metadata%%$'\n'*}
+    disk_lock_key=${disk_metadata#*$'\n'}
+    [[ -n "$disk_canonical" && -n "$disk_lock_key" ]] ||
+        die "disk security check returned empty canonical identity: $disk"
+    [[ "$disk_canonical" != *$'\n'* && "$disk_lock_key" != *$'\n'* ]] ||
+        die "disk security check returned empty canonical identity: $disk"
+    [[ "$disk_canonical" != *,* ]] ||
+        die "disk path cannot contain a comma"
+    disk=$disk_canonical
+fi
+
+global_lock_root=$("$PYTHON_BIN" - "${TMPDIR:-/tmp}" <<'PY'
+import os
+import sys
+
+base = os.path.realpath(sys.argv[1])
+print(os.path.join(base, f"fovea-m0-launch-{os.getuid()}"))
+PY
+) || die "failed to resolve global launch lock root"
+ensure_global_lock_root "$global_lock_root"
 
 qemu_argv=(
     "$QEMU_BIN"
@@ -184,17 +393,22 @@ if [[ -n "$disk" ]]; then
     qemu_argv+=(-drive "file=$disk,if=virtio")
 fi
 
-launch_lock="${qmp_socket}.fovea-launch"
-if ! (umask 077 && mkdir -- "$launch_lock") 2>/dev/null; then
-    die "launch resources are already reserved: $launch_lock"
+trap cleanup_on_exit EXIT
+trap 'forward_signal TERM 143' TERM
+trap 'forward_signal INT 130' INT
+
+acquire_launch_lock \
+    "${qmp_socket_canonical}.fovea-launch" \
+    "${qmp_socket}.fovea-launch"
+acquire_launch_lock \
+    "${pidfile_canonical}.fovea-launch" \
+    "${pidfile}.fovea-launch"
+acquire_launch_lock "${global_lock_root}/gdb-${gdb_port}.fovea-launch"
+acquire_launch_lock "${global_lock_root}/cid-${guest_cid}.fovea-launch"
+if [[ -n "$disk" ]]; then
+    acquire_launch_lock \
+        "${global_lock_root}/disk-${disk_lock_key}.fovea-launch"
 fi
-release_launch_lock() {
-    if ! rmdir -- "$launch_lock"; then
-        printf 'run-vm: failed to release launch reservation: %s\n' \
-            "$launch_lock" >&2
-    fi
-}
-trap release_launch_lock EXIT
 
 if ((dry_run)); then
     printf '%q ' "${qemu_argv[@]}"
@@ -202,4 +416,12 @@ if ((dry_run)); then
     exit 0
 fi
 
-"${qemu_argv[@]}"
+"${qemu_argv[@]}" &
+qemu_pid=$!
+if wait "$qemu_pid"; then
+    qemu_status=0
+else
+    qemu_status=$?
+fi
+qemu_pid=
+exit "$qemu_status"
