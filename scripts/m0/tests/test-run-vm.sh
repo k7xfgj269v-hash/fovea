@@ -696,6 +696,38 @@ run_resource_conflict_case \
     "" \
     guest-cid-lock
 
+LEADING_ZERO_PORT=$(free_port)
+run_resource_conflict_case \
+    "leading-zero GDB ports share one reservation" \
+    "gdb-${LEADING_ZERO_PORT}.fovea-launch" \
+    "$RUNTIME/leading-zero-port-first.qmp.sock" \
+    "$RUNTIME/leading-zero-port-first.pid" \
+    "$LEADING_ZERO_PORT" \
+    75 \
+    "$RUNTIME/leading-zero-port-second.qmp.sock" \
+    "$RUNTIME/leading-zero-port-second.pid" \
+    "0$LEADING_ZERO_PORT" \
+    76 \
+    "" \
+    "" \
+    leading-zero-gdb
+
+LEADING_ZERO_CID=77
+run_resource_conflict_case \
+    "leading-zero guest CIDs share one reservation" \
+    "cid-${LEADING_ZERO_CID}.fovea-launch" \
+    "$RUNTIME/leading-zero-cid-first.qmp.sock" \
+    "$RUNTIME/leading-zero-cid-first.pid" \
+    "$(free_port)" \
+    "$LEADING_ZERO_CID" \
+    "$RUNTIME/leading-zero-cid-second.qmp.sock" \
+    "$RUNTIME/leading-zero-cid-second.pid" \
+    "$(free_port)" \
+    "0$LEADING_ZERO_CID" \
+    "" \
+    "" \
+    leading-zero-cid
+
 SHARED_CROSS_TMP_PORT=$(free_port)
 run_resource_conflict_case \
     "different TMPDIRs reject a shared GDB port" \

@@ -339,6 +339,9 @@ QEMU_BIN="$QEMU_BIN" PYTHON_BIN="$PYTHON_BIN" "$SCRIPT_DIR/check-host.sh" \
     --memory-mib "$memory_mib" \
     --cpus "$cpus" >/dev/null
 
+gdb_port=$((10#$gdb_port))
+guest_cid=$((10#$guest_cid))
+
 qmp_socket_canonical=$(canonicalize_path "$qmp_socket") ||
     die "failed to canonicalize QMP socket path: $qmp_socket"
 pidfile_canonical=$(canonicalize_path "$pidfile") ||
