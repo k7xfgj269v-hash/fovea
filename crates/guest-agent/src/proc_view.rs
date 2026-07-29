@@ -10,6 +10,8 @@
 
 use introspect_schema::{MapKind, MapKindBucket, MemShape, RunState, TopMap};
 
+use crate::degradation::ProcDegradation;
+
 pub use crate::proc_source::ProcError;
 
 // ─── /proc/<pid>/stat 的裸解析产物 ─────────────────────────────────────────────
@@ -55,8 +57,10 @@ pub struct Status {
     /// `/proc/<pid>/status` 的 `voluntary_ctxt_switches:` 行单值。
     /// 缺行（stripped 内核偶见）默认 0——与 RSS=0 同语义：best-effort（§11）。
     pub voluntary_ctxt_switches: u64,
+    pub has_voluntary_ctxt_switches: bool,
     /// 同上，`nonvoluntary_ctxt_switches:` 行。
     pub nonvoluntary_ctxt_switches: u64,
+    pub has_nonvoluntary_ctxt_switches: bool,
 }
 
 // ─── 常量 ────────────────────────────────────────────────────────────────────
@@ -67,6 +71,9 @@ pub(crate) const CMDLINE_SHORT_MAX: usize = 256;
 
 /// §10 没硬给 top-N 的 N，本刀定 5。
 pub(crate) const MEM_SHAPE_TOP_N: usize = 5;
+
+/// Level 0 top-map backing 的 UTF-8 字节上限。
+pub const TOP_MAP_BACKING_MAX_BYTES: usize = 256;
 
 // ─── §13.4 parse_stat：从右括号 ')' 切回 ────────────────────────────────────
 
@@ -110,8 +117,22 @@ pub fn parse_stat(content: &str) -> Result<Stat, ProcError> {
         })?;
     // comm = 括号内（去括号）。 不再加回括号——§10 identity.comm 是不带括号的进程名。
     let comm = content[lparen + 1..rparen].to_string();
+    // 内核格式在右括号后固定为 ` state ...`。先验证 state 槽没有被空白吞掉，
+    // 再做后续分词，否则缺失 state 时 ppid 会被误当成未知状态。
+    let after_comm = content[rparen + 1..]
+        .strip_prefix(' ')
+        .ok_or_else(|| ProcError::Parse {
+            what: "stat.state".into(),
+            reason: "comm 后缺 state 分隔空格".into(),
+        })?;
+    if after_comm.chars().next().is_none_or(char::is_whitespace) {
+        return Err(ProcError::Parse {
+            what: "stat.state".into(),
+            reason: "空状态".into(),
+        });
+    }
     // 右括号之后按空格分词。第一个 = state（单字符）。
-    let tail = content[rparen + 1..].trim();
+    let tail = after_comm.trim();
     let fields: Vec<&str> = tail.split_whitespace().collect();
     // tail 字段索引按 man proc 编号减 3 （因为括号前是 1=pid/2=comm）。
     // fields[0] = state, fields[1] = ppid ... fields[i] = 字段编号 (i+3)。
@@ -266,14 +287,45 @@ pub fn parse_system_cpu(content: &str) -> Result<SystemCpu, ProcError> {
     })
 }
 
-/// Parse the first cgroup path from `/proc/<pid>/cgroup`.
+/// Parse the effective cgroup path from `/proc/<pid>/cgroup`.
 pub fn parse_cgroup(content: &str) -> Result<Option<String>, ProcError> {
-    let Some(line) = content.lines().find(|line| !line.trim().is_empty()) else {
-        return Ok(None);
-    };
+    let mut first_v1 = None;
+    let mut first_error = None;
+
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        match parse_cgroup_line(line) {
+            Ok(CgroupEntry::Unified(path)) => return Ok(Some(path)),
+            Ok(CgroupEntry::Legacy(path)) => {
+                if first_v1.is_none() {
+                    first_v1 = Some(path);
+                }
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+
+    if let Some(path) = first_v1 {
+        return Ok(Some(path));
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(None)
+}
+
+enum CgroupEntry {
+    Unified(String),
+    Legacy(String),
+}
+
+fn parse_cgroup_line(line: &str) -> Result<CgroupEntry, ProcError> {
     let mut fields = line.splitn(3, ':');
-    let _hierarchy = fields.next();
-    let _controllers = fields.next().ok_or_else(|| ProcError::Parse {
+    let hierarchy = fields.next().unwrap_or_default();
+    let controllers = fields.next().ok_or_else(|| ProcError::Parse {
         what: "cgroup".into(),
         reason: "缺 controllers 字段".into(),
     })?;
@@ -287,7 +339,28 @@ pub fn parse_cgroup(content: &str) -> Result<Option<String>, ProcError> {
             reason: "path 为空".into(),
         });
     }
-    Ok(Some(path.to_string()))
+    hierarchy.parse::<u32>().map_err(|error| ProcError::Parse {
+        what: "cgroup".into(),
+        reason: format!("hierarchy 非数字 {hierarchy:?}: {error}"),
+    })?;
+
+    if hierarchy == "0" {
+        if controllers.is_empty() {
+            Ok(CgroupEntry::Unified(path.to_string()))
+        } else {
+            Err(ProcError::Parse {
+                what: "cgroup".into(),
+                reason: "cgroup v2 hierarchy 0 的 controllers 必须为空".into(),
+            })
+        }
+    } else if controllers.is_empty() {
+        Err(ProcError::Parse {
+            what: "cgroup".into(),
+            reason: "cgroup v1 controllers 为空".into(),
+        })
+    } else {
+        Ok(CgroupEntry::Legacy(path.to_string()))
+    }
 }
 
 fn parse_run_state(s: &str) -> Result<RunState, ProcError> {
@@ -297,17 +370,7 @@ fn parse_run_state(s: &str) -> Result<RunState, ProcError> {
         what: "stat.state".into(),
         reason: "空状态".into(),
     })?;
-    match c {
-        'R' => Ok(RunState::R),
-        'S' => Ok(RunState::S),
-        'D' => Ok(RunState::D),
-        'Z' => Ok(RunState::Z),
-        'T' => Ok(RunState::T),
-        other => Err(ProcError::Parse {
-            what: "stat.state".into(),
-            reason: format!("未知 state 字符 {other:?}"),
-        }),
-    }
+    Ok(RunState::from_char(c))
 }
 
 // ─── §13.4 parse_status：Key:\t Value 行格式 ──────────────────────────────
@@ -347,6 +410,7 @@ pub fn parse_status(content: &str) -> Result<Status, ProcError> {
                         what: "status.voluntary_ctxt_switches".into(),
                         reason: e.to_string(),
                     })?;
+            st.has_voluntary_ctxt_switches = true;
         } else if let Some(rest) = line.strip_prefix("nonvoluntary_ctxt_switches:") {
             st.nonvoluntary_ctxt_switches =
                 rest.trim()
@@ -355,12 +419,21 @@ pub fn parse_status(content: &str) -> Result<Status, ProcError> {
                         what: "status.nonvoluntary_ctxt_switches".into(),
                         reason: e.to_string(),
                     })?;
+            st.has_nonvoluntary_ctxt_switches = true;
         }
     }
     Ok(st)
 }
 
 // ─── §13.4 parse_maps：皇冠明珠投影本体 ──────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ParsedMaps {
+    pub mem_shape: MemShape,
+    pub valid_line_count: usize,
+    pub skipped_line_count: usize,
+    pub degradations: Vec<ProcDegradation>,
+}
 
 /// `/proc/<pid>/maps` 的解析 + 投影聚合（§10 mem_shape）。
 ///
@@ -374,19 +447,29 @@ pub fn parse_status(content: &str) -> Result<Status, ProcError> {
 /// 表透出**——GB 级 maps → 十几行（histogram 5 类最多 5 行 + top-N 最多 5 行），
 /// 这就是 §10「投影本体」代码归宿。
 pub fn parse_maps(content: &str) -> Result<MemShape, ProcError> {
+    Ok(parse_maps_with_diagnostics(content)?.mem_shape)
+}
+
+pub fn parse_maps_with_diagnostics(content: &str) -> Result<ParsedMaps, ProcError> {
     let mut buckets: std::collections::HashMap<MapKind, (u64, u64)> =
         std::collections::HashMap::with_capacity(5);
     let mut tops: Vec<TopMap> = Vec::new();
+    let mut valid_line_count = 0usize;
+    let mut skipped_line_count = 0usize;
 
     for line in content.lines() {
         let line = line.trim_end();
         if line.is_empty() {
             continue;
         }
-        let map = parse_map_line(line).map_err(|e| ProcError::Parse {
-            what: "maps".into(),
-            reason: e,
-        })?;
+        let map = match parse_map_line(line) {
+            Ok(map) => map,
+            Err(_) => {
+                skipped_line_count += 1;
+                continue;
+            }
+        };
+        valid_line_count += 1;
         let kind = classify_map_kind(&map.perms, map.path.as_deref()).unwrap_or(MapKind::Anon); // 无 path → Anon；§10 五类里没列的归 Anon 兜底
         let size = map.end.saturating_sub(map.start);
         // 直方图累加
@@ -425,9 +508,39 @@ pub fn parse_maps(content: &str) -> Result<MemShape, ProcError> {
     tops.sort_by_key(|map| std::cmp::Reverse(map.size));
     tops.truncate(MEM_SHAPE_TOP_N);
 
-    Ok(MemShape {
-        histogram,
-        top_n: tops,
+    let mut degradations = Vec::new();
+    if skipped_line_count > 0 {
+        degradations.push(ProcDegradation::new(
+            "mem_shape",
+            format!("skipped {skipped_line_count} malformed maps lines"),
+        ));
+    }
+    for (index, top) in tops.iter_mut().enumerate() {
+        let Some(backing) = top.backing.as_mut() else {
+            continue;
+        };
+        let original_len = backing.len();
+        if original_len <= TOP_MAP_BACKING_MAX_BYTES {
+            continue;
+        }
+        *backing = truncate_utf8_bytes(backing, TOP_MAP_BACKING_MAX_BYTES);
+        degradations.push(ProcDegradation::new(
+            format!("mem_shape.top_n[{index}].backing"),
+            format!(
+                "backing truncated from {original_len} to {} UTF-8 bytes",
+                backing.len()
+            ),
+        ));
+    }
+
+    Ok(ParsedMaps {
+        mem_shape: MemShape {
+            histogram,
+            top_n: tops,
+        },
+        valid_line_count,
+        skipped_line_count,
+        degradations,
     })
 }
 
@@ -453,6 +566,9 @@ fn parse_map_line(line: &str) -> Result<MapLine, String> {
         .map_err(|e| format!("start 非十六进制 {start_s:?}: {e}"))?;
     let end = u64::from_str_radix(end_s.trim(), 16)
         .map_err(|e| format!("end 非十六进制 {end_s:?}: {e}"))?;
+    if end <= start {
+        return Err(format!("地址范围非递增: {start_s:?}-{end_s:?}"));
+    }
 
     // 从 rest 里拆 perms 与 path。perms 段是首字段 4 个 char, 之后空格, 然后 offset/dev/inode,
     // 然后 1 个或更多空格 + path (或没 path)。
@@ -466,8 +582,23 @@ fn parse_map_line(line: &str) -> Result<MapLine, String> {
     // 在 M1 简化口径下: 用 token 计数, 多于 5 个 token 说明 path 存在.
     let tokens: Vec<&str> = rest.split_whitespace().collect();
     // tokens[0]=perms, tokens[1]=offset, tokens[2]=dev, tokens[3]=inode, tokens[4..]=path
+    if tokens.len() < 4 {
+        return Err("缺 offset/dev/inode 字段".into());
+    }
+    u64::from_str_radix(tokens[1], 16)
+        .map_err(|error| format!("offset 非十六进制 {:?}: {error}", tokens[1]))?;
+    let (dev_major, dev_minor) = tokens[2]
+        .split_once(':')
+        .ok_or_else(|| format!("dev 字段无 ':': {:?}", tokens[2]))?;
+    u64::from_str_radix(dev_major, 16)
+        .map_err(|error| format!("dev major 非十六进制 {dev_major:?}: {error}"))?;
+    u64::from_str_radix(dev_minor, 16)
+        .map_err(|error| format!("dev minor 非十六进制 {dev_minor:?}: {error}"))?;
+    tokens[3]
+        .parse::<u64>()
+        .map_err(|error| format!("inode 非十进制 {:?}: {error}", tokens[3]))?;
     let path = if tokens.len() > 4 {
-        let path_start_byte_in_rest = rest.find(tokens[4]).ok_or("path 起点定位失败")?;
+        let path_start_byte_in_rest = whitespace_token_start(rest, 4).ok_or("path 起点定位失败")?;
         Some(rest[path_start_byte_in_rest..].trim().to_string())
     } else {
         None
@@ -479,6 +610,35 @@ fn parse_map_line(line: &str) -> Result<MapLine, String> {
         perms,
         path,
     })
+}
+
+fn whitespace_token_start(input: &str, target: usize) -> Option<usize> {
+    let mut token_index = 0usize;
+    let mut in_token = false;
+
+    for (index, character) in input.char_indices() {
+        if character.is_whitespace() {
+            in_token = false;
+        } else if !in_token {
+            if token_index == target {
+                return Some(index);
+            }
+            token_index += 1;
+            in_token = true;
+        }
+    }
+    None
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 // ─── §13.4 classify_map_kind：kind 五分类 ─────────────────────────────────
