@@ -27,7 +27,7 @@ VM configuration:
   -h, --help         Show this help
 
 Narrow test/tool overrides:
-  UNAME_BIN, QEMU_BIN, KVM_DEVICE, PYTHON_BIN
+  UNAME_BIN, QEMU_BIN, KVM_DEVICE, PYTHON_BIN, FOVEA_LOCK_ROOT
 EOF
 }
 
@@ -348,15 +348,10 @@ if [[ -n "$disk" ]]; then
     disk=$disk_canonical
 fi
 
-global_lock_root=$("$PYTHON_BIN" - "${TMPDIR:-/tmp}" <<'PY'
-import os
-import sys
-
-base = os.path.realpath(sys.argv[1])
-print(os.path.join(base, f"fovea-m0-launch-{os.getuid()}"))
-PY
-) || die "failed to resolve global launch lock root"
+global_lock_root=${FOVEA_LOCK_ROOT:-/tmp/fovea-m0-launch-$(id -u)}
 ensure_global_lock_root "$global_lock_root"
+global_lock_root=$(canonicalize_path "$global_lock_root") ||
+    die "failed to canonicalize global launch lock root: $global_lock_root"
 
 qemu_argv=(
     "$QEMU_BIN"
@@ -366,9 +361,9 @@ qemu_argv=(
     -m "$memory_mib"
     -smp "$cpus"
     -device "vhost-vsock-pci,guest-cid=$guest_cid"
-    -qmp "unix:$qmp_socket,server=on,wait=off"
+    -qmp "unix:$qmp_socket_canonical,server=on,wait=off"
     -gdb "tcp:127.0.0.1:$gdb_port"
-    -pidfile "$pidfile"
+    -pidfile "$pidfile_canonical"
     -no-reboot
     -nographic
 )

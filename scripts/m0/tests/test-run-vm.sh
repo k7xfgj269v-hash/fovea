@@ -129,9 +129,23 @@ FAKE_BIN="$TMP_ROOT/bin"
 PYTHON_MODULES="$TMP_ROOT/python-modules"
 RUNTIME="$TMP_ROOT/runtime"
 PRIVATE_TMPDIR="$TMP_ROOT/tmp"
+ALTERNATE_TMPDIR="$TMP_ROOT/alternate-tmp"
+GLOBAL_LOCK_ROOT="$TMP_ROOT/global-locks"
 ARTIFACTS="$TMP_ROOT/artifacts with spaces"
-mkdir -p "$FAKE_BIN" "$PYTHON_MODULES" "$RUNTIME" "$PRIVATE_TMPDIR" "$ARTIFACTS"
-chmod 700 "$RUNTIME" "$PRIVATE_TMPDIR" "$ARTIFACTS"
+mkdir -p \
+    "$FAKE_BIN" \
+    "$PYTHON_MODULES" \
+    "$RUNTIME" \
+    "$PRIVATE_TMPDIR" \
+    "$ALTERNATE_TMPDIR" \
+    "$GLOBAL_LOCK_ROOT" \
+    "$ARTIFACTS"
+chmod 700 \
+    "$RUNTIME" \
+    "$PRIVATE_TMPDIR" \
+    "$ALTERNATE_TMPDIR" \
+    "$GLOBAL_LOCK_ROOT" \
+    "$ARTIFACTS"
 
 cat >"$FAKE_BIN/uname" <<'EOF'
 #!/bin/sh
@@ -182,8 +196,11 @@ PY
 }
 
 run_vm_fixture() {
+    local fixture_tmpdir=${FIXTURE_TMPDIR:-$PRIVATE_TMPDIR}
+
     env \
-        TMPDIR="$PRIVATE_TMPDIR" \
+        TMPDIR="$fixture_tmpdir" \
+        FOVEA_LOCK_ROOT="$GLOBAL_LOCK_ROOT" \
         PYTHONPATH="$PYTHON_MODULES${PYTHONPATH:+:$PYTHONPATH}" \
         UNAME_BIN="$FAKE_BIN/uname" \
         QEMU_BIN="${QEMU_OVERRIDE:-$FAKE_BIN/qemu-system-x86_64}" \
@@ -237,8 +254,27 @@ run_failure_case \
 
 tests=$((tests + 1))
 dry_name="dry-run preserves shell-safe argv and exact VM flags"
-QMP_PATH="$RUNTIME/qmp socket.sock"
-PID_PATH="$RUNTIME/qemu pid"
+PATH_ALIAS_ROOT="$RUNTIME/path-alias"
+mkdir "$PATH_ALIAS_ROOT"
+mkdir "$PATH_ALIAS_ROOT/real"
+chmod 700 "$PATH_ALIAS_ROOT" "$PATH_ALIAS_ROOT/real"
+ln -s "$PATH_ALIAS_ROOT/real" "$PATH_ALIAS_ROOT/link"
+QMP_PATH="$PATH_ALIAS_ROOT/link/../qmp socket.sock"
+PID_PATH="$PATH_ALIAS_ROOT/link/../qemu pid"
+QMP_CANONICAL=$("$PYTHON" - "$QMP_PATH" <<'PY'
+import os
+import sys
+
+print(os.path.realpath(sys.argv[1]))
+PY
+)
+PID_CANONICAL=$("$PYTHON" - "$PID_PATH" <<'PY'
+import os
+import sys
+
+print(os.path.realpath(sys.argv[1]))
+PY
+)
 GDB_PORT=$(free_port)
 if run_vm_fixture \
     --kernel "$KERNEL" \
@@ -262,9 +298,9 @@ if run_vm_fixture \
         -m 3072
         -smp 4
         -device "vhost-vsock-pci,guest-cid=9"
-        -qmp "unix:$QMP_PATH,server=on,wait=off"
+        -qmp "unix:$QMP_CANONICAL,server=on,wait=off"
         -gdb "tcp:127.0.0.1:$GDB_PORT"
-        -pidfile "$PID_PATH"
+        -pidfile "$PID_CANONICAL"
         -no-reboot
         -nographic
         -kernel "$KERNEL"
@@ -309,6 +345,7 @@ start_waiting_vm() {
     local stdout_file=$7
     local stderr_file=$8
     local disk=${9-}
+    local fixture_tmpdir=${10:-$PRIVATE_TMPDIR}
     local vm_pid
     local -a vm_args
 
@@ -327,7 +364,8 @@ start_waiting_vm() {
 
     (
         exec env \
-            TMPDIR="$PRIVATE_TMPDIR" \
+            TMPDIR="$fixture_tmpdir" \
+            FOVEA_LOCK_ROOT="$GLOBAL_LOCK_ROOT" \
             PYTHONPATH="$PYTHON_MODULES${PYTHONPATH:+:$PYTHONPATH}" \
             UNAME_BIN="$FAKE_BIN/uname" \
             QEMU_BIN="$WAIT_QEMU" \
@@ -365,6 +403,8 @@ run_resource_conflict_case() {
     local first_disk=${11-}
     local second_disk=${12-}
     local label=${13}
+    local first_tmpdir=${14:-$PRIVATE_TMPDIR}
+    local second_tmpdir=${15:-$PRIVATE_TMPDIR}
     local first_ready="$TMP_ROOT/$label.first.ready"
     local first_release="$TMP_ROOT/$label.first.release"
     local second_ready="$TMP_ROOT/$label.second.ready"
@@ -377,7 +417,7 @@ run_resource_conflict_case() {
     local second_status
     local first_status
     local disk_key
-    local lock_root="$PRIVATE_TMPDIR/fovea-m0-launch-$(id -u)"
+    local lock_root="$GLOBAL_LOCK_ROOT"
     local -a first_locks
     local -a second_args
 
@@ -403,7 +443,7 @@ PY
     if ! start_waiting_vm \
         "$first_qmp" "$first_pidfile" "$first_port" "$first_cid" \
         "$first_ready" "$first_release" "$first_stdout" "$first_stderr" \
-        "$first_disk"; then
+        "$first_disk" "$first_tmpdir"; then
         fail "$name (first fake QEMU did not stay active)"
         sed 's/^/  stderr: /' "$first_stderr" >&2
         return
@@ -428,7 +468,8 @@ PY
         second_args+=(--disk "$second_disk")
     fi
 
-    if QEMU_OVERRIDE="$WAIT_QEMU" \
+    if FIXTURE_TMPDIR="$second_tmpdir" \
+        QEMU_OVERRIDE="$WAIT_QEMU" \
         FAKE_QEMU_READY="$second_ready" \
         FAKE_QEMU_RELEASE="$second_release" \
         run_vm_fixture "${second_args[@]}" \
@@ -530,6 +571,69 @@ run_resource_conflict_case \
     "" \
     guest-cid-lock
 
+SHARED_CROSS_TMP_PORT=$(free_port)
+run_resource_conflict_case \
+    "different TMPDIRs reject a shared GDB port" \
+    "gdb-${SHARED_CROSS_TMP_PORT}.fovea-launch" \
+    "$RUNTIME/cross-tmp-port-first.qmp.sock" \
+    "$RUNTIME/cross-tmp-port-first.pid" \
+    "$SHARED_CROSS_TMP_PORT" \
+    81 \
+    "$RUNTIME/cross-tmp-port-second.qmp.sock" \
+    "$RUNTIME/cross-tmp-port-second.pid" \
+    "$SHARED_CROSS_TMP_PORT" \
+    82 \
+    "" \
+    "" \
+    cross-tmp-gdb \
+    "$PRIVATE_TMPDIR" \
+    "$ALTERNATE_TMPDIR"
+
+SHARED_CROSS_TMP_CID=91
+run_resource_conflict_case \
+    "different TMPDIRs reject a shared guest CID" \
+    "cid-${SHARED_CROSS_TMP_CID}.fovea-launch" \
+    "$RUNTIME/cross-tmp-cid-first.qmp.sock" \
+    "$RUNTIME/cross-tmp-cid-first.pid" \
+    "$(free_port)" \
+    "$SHARED_CROSS_TMP_CID" \
+    "$RUNTIME/cross-tmp-cid-second.qmp.sock" \
+    "$RUNTIME/cross-tmp-cid-second.pid" \
+    "$(free_port)" \
+    "$SHARED_CROSS_TMP_CID" \
+    "" \
+    "" \
+    cross-tmp-cid \
+    "$PRIVATE_TMPDIR" \
+    "$ALTERNATE_TMPDIR"
+
+SHARED_CROSS_TMP_DISK="$ARTIFACTS/cross-tmp-disk-hardlink.qcow2"
+ln "$DISK" "$SHARED_CROSS_TMP_DISK"
+CROSS_TMP_DISK_LOCK_KEY=$("$PYTHON" - "$DISK" <<'PY'
+import os
+import sys
+
+disk_stat = os.stat(sys.argv[1])
+print(f"{disk_stat.st_dev:x}-{disk_stat.st_ino:x}")
+PY
+)
+run_resource_conflict_case \
+    "different TMPDIRs reject a shared disk identity" \
+    "disk-${CROSS_TMP_DISK_LOCK_KEY}.fovea-launch" \
+    "$RUNTIME/cross-tmp-disk-first.qmp.sock" \
+    "$RUNTIME/cross-tmp-disk-first.pid" \
+    "$(free_port)" \
+    101 \
+    "$RUNTIME/cross-tmp-disk-second.qmp.sock" \
+    "$RUNTIME/cross-tmp-disk-second.pid" \
+    "$(free_port)" \
+    102 \
+    "$DISK" \
+    "$SHARED_CROSS_TMP_DISK" \
+    cross-tmp-disk \
+    "$PRIVATE_TMPDIR" \
+    "$ALTERNATE_TMPDIR"
+
 DISK_HARDLINK="$ARTIFACTS/disk-hardlink.qcow2"
 ln "$DISK" "$DISK_HARDLINK"
 DISK_LOCK_KEY=$("$PYTHON" - "$DISK" <<'PY'
@@ -588,7 +692,7 @@ SIGNAL_TERM_RELEASE="$TMP_ROOT/signal.term-release"
 SIGNAL_QEMU_PID_FILE="$TMP_ROOT/signal.qemu-pid"
 SIGNAL_STDOUT="$TMP_ROOT/signal.stdout"
 SIGNAL_STDERR="$TMP_ROOT/signal.stderr"
-SIGNAL_LOCK_ROOT="$PRIVATE_TMPDIR/fovea-m0-launch-$(id -u)"
+SIGNAL_LOCK_ROOT="$GLOBAL_LOCK_ROOT"
 SIGNAL_WRAPPER_PID=
 SIGNAL_QEMU_PID=
 TERM_RELEASE_FILES[${#TERM_RELEASE_FILES[@]}]="$SIGNAL_TERM_RELEASE"
@@ -598,6 +702,7 @@ signal_pass=1
 (
     exec env \
         TMPDIR="$PRIVATE_TMPDIR" \
+        FOVEA_LOCK_ROOT="$GLOBAL_LOCK_ROOT" \
         PYTHONPATH="$PYTHON_MODULES${PYTHONPATH:+:$PYTHONPATH}" \
         UNAME_BIN="$FAKE_BIN/uname" \
         QEMU_BIN="$SIGNAL_QEMU" \
