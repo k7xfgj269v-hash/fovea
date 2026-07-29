@@ -228,7 +228,6 @@ fn build_level0(
 ) -> Result<Level0, ProcError> {
     let status = proc_view::parse_status(&snapshot.status)?;
     let mem_shape = proc_view::parse_maps(&snapshot.maps)?;
-    let nr_fds = proc_view::scan_fds_from_names(&snapshot.fd_names);
     let wchan_raw = snapshot
         .wchan
         .as_deref()
@@ -263,7 +262,7 @@ fn build_level0(
     let resource = Resource {
         rss_bytes: stat.rss.saturating_mul(snapshot.page_size_bytes),
         vsz_bytes: stat.vsize,
-        nr_fds,
+        nr_fds: snapshot.nr_fds,
         pct_cpu: cpu_sample.pct_cpu,
         ctxt_switches: introspect_schema::CtxtSwitches {
             voluntary: status.voluntary_ctxt_switches,
@@ -313,16 +312,18 @@ pub fn introspect_with_inputs(
     symbolizer: &dyn Symbolizer,
 ) -> Result<Level0, ProcError> {
     validate_requested_pid(pid)?;
+    let nr_fds = proc_view::scan_fds_from_names(fd_names);
     let snapshot = ProcSnapshot {
         stat: stat_s.to_string(),
         status: status_s.to_string(),
         maps: maps_s.to_string(),
         wchan: Some(wchan_s.to_string()),
         cmdline: cmdline_bytes.to_vec(),
-        fd_names: fd_names.to_vec(),
+        nr_fds,
         kernel_stack: Some(stack_s.to_string()),
         exe: None,
         cgroup: None,
+        degradations: Vec::new(),
         system_cpu_ticks: 0,
         logical_cpus: 1,
         page_size_bytes: 4096,
@@ -525,10 +526,11 @@ mod tests {
             maps: "".into(),
             wchan: None,
             cmdline: b"./demo\0--foo\0".to_vec(),
-            fd_names: vec!["0".into(), "1".into(), "2".into()],
+            nr_fds: 3,
             kernel_stack: None,
             exe: Some("/usr/bin/demo".into()),
             cgroup: Some("/user.slice/demo.scope".into()),
+            degradations: Vec::new(),
             system_cpu_ticks: 1_000,
             logical_cpus: 4,
             page_size_bytes: 4096,
@@ -603,7 +605,7 @@ mod tests {
         snapshot.maps = "7f0000000000-7f0000100000 rw-p 00000000 00:00 0 [heap]\n".into();
         snapshot.wchan = Some("futex_wait_queue_me\n".into());
         snapshot.cmdline = b"/usr/bin/demo\0--mode\0contract\0".to_vec();
-        snapshot.fd_names = vec![".".into(), "..".into(), "0".into(), "1".into()];
+        snapshot.nr_fds = 2;
         snapshot.kernel_stack = Some("[<0000000000000001>] futex_wait_queue_me+0x1/0x2\n".into());
         let source = Arc::new(MockProcSource::new(
             snapshot,

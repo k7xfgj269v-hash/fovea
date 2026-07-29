@@ -5,6 +5,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::degradation::ProcDegradation;
+
 /// All procfs inputs needed to assemble one Level 0 result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcSnapshot {
@@ -13,10 +15,11 @@ pub struct ProcSnapshot {
     pub maps: String,
     pub wchan: Option<String>,
     pub cmdline: Vec<u8>,
-    pub fd_names: Vec<String>,
+    pub nr_fds: u32,
     pub kernel_stack: Option<String>,
     pub exe: Option<String>,
     pub cgroup: Option<String>,
+    pub degradations: Vec<ProcDegradation>,
     pub system_cpu_ticks: u64,
     pub logical_cpus: u32,
     pub page_size_bytes: u64,
@@ -168,6 +171,96 @@ where
 }
 
 #[cfg(any(test, target_os = "linux"))]
+const STAT_LOSSY_PATHS: &[&str] = &["identity.comm"];
+#[cfg(any(test, target_os = "linux"))]
+const STATUS_LOSSY_PATHS: &[&str] = &["identity.uid", "resource.ctxt_switches"];
+#[cfg(any(test, target_os = "linux"))]
+const MAPS_LOSSY_PATHS: &[&str] = &["mem_shape"];
+#[cfg(any(test, target_os = "linux"))]
+const WCHAN_LOSSY_PATHS: &[&str] = &["state.wchan"];
+#[cfg(any(test, target_os = "linux"))]
+const STACK_LOSSY_PATHS: &[&str] = &["hotspot.frames"];
+#[cfg(any(test, target_os = "linux"))]
+const CGROUP_LOSSY_PATHS: &[&str] = &["identity.cgroup"];
+#[cfg(any(test, target_os = "linux"))]
+const EXE_LOSSY_PATHS: &[&str] = &["identity.exe"];
+#[cfg(any(test, target_os = "linux"))]
+const CMDLINE_LOSSY_PATHS: &[&str] = &["identity.cmdline"];
+
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecodedProcText {
+    value: String,
+    degradations: Vec<ProcDegradation>,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn invalid_utf8_degradations(
+    bytes: &[u8],
+    what: &str,
+    affected_paths: &[&str],
+) -> Vec<ProcDegradation> {
+    if std::str::from_utf8(bytes).is_ok() {
+        return Vec::new();
+    }
+
+    let reason = format!("{what} 包含非 UTF-8 字节，已用 U+FFFD 替换");
+    affected_paths
+        .iter()
+        .map(|path| ProcDegradation::new(*path, reason.clone()))
+        .collect()
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn decode_proc_text(bytes: &[u8], what: &str, affected_paths: &[&str]) -> DecodedProcText {
+    DecodedProcText {
+        value: String::from_utf8_lossy(bytes).into_owned(),
+        degradations: invalid_utf8_degradations(bytes, what, affected_paths),
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessGeneration {
+    pid: i32,
+    start_time_ticks: u64,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+impl From<&crate::proc_view::Stat> for ProcessGeneration {
+    fn from(stat: &crate::proc_view::Stat) -> Self {
+        Self {
+            pid: stat.pid,
+            start_time_ticks: stat.process_start_time_ticks,
+        }
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn with_stable_process_generation<T, ReadSnapshot, ReadFinalGeneration>(
+    requested_pid: i32,
+    initial: ProcessGeneration,
+    read_snapshot: ReadSnapshot,
+    read_final_generation: ReadFinalGeneration,
+) -> Result<T, ProcError>
+where
+    ReadSnapshot: FnOnce() -> Result<T, ProcError>,
+    ReadFinalGeneration: FnOnce() -> Result<ProcessGeneration, ProcError>,
+{
+    if initial.pid != requested_pid {
+        return Err(ProcError::ProcNotFound { pid: requested_pid });
+    }
+
+    let snapshot = read_snapshot()?;
+    let final_generation = read_final_generation()?;
+    if final_generation.pid != requested_pid || final_generation != initial {
+        return Err(ProcError::ProcNotFound { pid: requested_pid });
+    }
+
+    Ok(snapshot)
+}
+
+#[cfg(any(test, target_os = "linux"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcIoScope {
     Process,
@@ -210,16 +303,19 @@ impl SampleClock for ThreadSampleClock {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::ffi::OsString;
     use std::fs;
     use std::io::{Error, ErrorKind};
+    use std::os::unix::ffi::OsStringExt;
     use std::path::{Path, PathBuf};
 
     use introspect_schema::RunState;
 
     use super::{
-        classify_proc_io, read_adjacent_cpu_pair, CpuCounters, ProcError, ProcIoErrorClass,
-        ProcIoScope, ProcSnapshot, ProcSource,
+        classify_proc_io, decode_proc_text, invalid_utf8_degradations, read_adjacent_cpu_pair,
+        with_stable_process_generation, CpuCounters, DecodedProcText, ProcError, ProcIoErrorClass,
+        ProcIoScope, ProcSnapshot, ProcSource, ProcessGeneration, CGROUP_LOSSY_PATHS,
+        CMDLINE_LOSSY_PATHS, EXE_LOSSY_PATHS, MAPS_LOSSY_PATHS, STACK_LOSSY_PATHS,
+        STATUS_LOSSY_PATHS, STAT_LOSSY_PATHS, WCHAN_LOSSY_PATHS,
     };
     use crate::proc_view::{parse_cgroup, parse_stat, parse_system_cpu};
 
@@ -232,48 +328,111 @@ mod linux {
         }
     }
 
+    struct SnapshotReads {
+        status: DecodedProcText,
+        maps: DecodedProcText,
+        wchan: Option<DecodedProcText>,
+        cmdline: Vec<u8>,
+        nr_fds: u32,
+        kernel_stack: Option<DecodedProcText>,
+        exe: Option<DecodedProcText>,
+        cgroup: Option<DecodedProcText>,
+        page_size_bytes: u64,
+    }
+
     impl ProcSource for LinuxProcSource {
         fn snapshot(&self, pid: i32) -> Result<ProcSnapshot, ProcError> {
-            let (stat, system) =
-                read_adjacent_cpu_pair(|| read_required_string(pid, "stat"), read_system_cpu)?;
-            let parsed_stat = parse_stat(&stat)?;
-            let status = read_required_string(pid, "status")?;
-            let maps = read_required_string(pid, "maps")?;
-            let wchan = read_optional_string(pid, "wchan")?;
-            let cmdline = read_required_bytes(pid, "cmdline")?;
-            let fd_names = read_fd_names(pid)?;
-            let kernel_stack = if parsed_stat.state == RunState::D {
-                read_optional_string(pid, "stack")?
-            } else {
-                None
-            };
-            let exe = read_exe(pid)?;
-            let cgroup = match read_optional_string(pid, "cgroup")? {
-                Some(content) => parse_cgroup(&content)?,
+            let (stat, system) = read_adjacent_cpu_pair(
+                || read_required_text(pid, "stat", STAT_LOSSY_PATHS),
+                read_system_cpu,
+            )?;
+            let parsed_stat = parse_stat(&stat.value)?;
+            let initial_generation = ProcessGeneration::from(&parsed_stat);
+            let reads = with_stable_process_generation(
+                pid,
+                initial_generation,
+                || {
+                    let status = read_required_text(pid, "status", STATUS_LOSSY_PATHS)?;
+                    let maps = read_required_text(pid, "maps", MAPS_LOSSY_PATHS)?;
+                    let wchan = read_optional_text(pid, "wchan", WCHAN_LOSSY_PATHS)?;
+                    let cmdline = read_required_bytes(pid, "cmdline")?;
+                    let nr_fds = read_fd_count(pid)?;
+                    let kernel_stack = if parsed_stat.state == RunState::D {
+                        read_optional_text(pid, "stack", STACK_LOSSY_PATHS)?
+                    } else {
+                        None
+                    };
+                    let exe = read_exe(pid)?;
+                    let cgroup = read_optional_text(pid, "cgroup", CGROUP_LOSSY_PATHS)?;
+                    let page_size_bytes = page_size_bytes()?;
+
+                    Ok(SnapshotReads {
+                        status,
+                        maps,
+                        wchan,
+                        cmdline,
+                        nr_fds,
+                        kernel_stack,
+                        exe,
+                        cgroup,
+                        page_size_bytes,
+                    })
+                },
+                || read_process_generation(pid),
+            )?;
+
+            let mut degradations = stat.degradations;
+            degradations.extend(reads.status.degradations);
+            degradations.extend(reads.maps.degradations);
+            degradations.extend(invalid_utf8_degradations(
+                &reads.cmdline,
+                "cmdline",
+                CMDLINE_LOSSY_PATHS,
+            ));
+
+            let wchan = reads.wchan.map(|text| {
+                degradations.extend(text.degradations);
+                text.value
+            });
+            let kernel_stack = reads.kernel_stack.map(|text| {
+                degradations.extend(text.degradations);
+                text.value
+            });
+            let exe = reads.exe.map(|text| {
+                degradations.extend(text.degradations);
+                text.value
+            });
+            let cgroup = match reads.cgroup {
+                Some(text) => {
+                    degradations.extend(text.degradations);
+                    parse_cgroup(&text.value)?
+                }
                 None => None,
             };
-            let page_size_bytes = page_size_bytes()?;
 
             Ok(ProcSnapshot {
-                stat,
-                status,
-                maps,
+                stat: stat.value,
+                status: reads.status.value,
+                maps: reads.maps.value,
                 wchan,
-                cmdline,
-                fd_names,
+                cmdline: reads.cmdline,
+                nr_fds: reads.nr_fds,
                 kernel_stack,
                 exe,
                 cgroup,
+                degradations,
                 system_cpu_ticks: system.ticks,
                 logical_cpus: system.logical_cpus,
-                page_size_bytes,
+                page_size_bytes: reads.page_size_bytes,
             })
         }
 
         fn cpu_counters(&self, pid: i32) -> Result<CpuCounters, ProcError> {
-            let (stat, system) =
-                read_adjacent_cpu_pair(|| read_required_string(pid, "stat"), read_system_cpu)?;
-            let stat = parse_stat(&stat)?;
+            let (stat, system) = read_adjacent_cpu_pair(
+                || read_required_text(pid, "stat", STAT_LOSSY_PATHS),
+                read_system_cpu,
+            )?;
+            let stat = parse_stat(&stat.value)?;
             Ok(CpuCounters {
                 process_ticks: stat.process_ticks,
                 system_ticks: system.ticks,
@@ -286,9 +445,14 @@ mod linux {
         Path::new("/proc").join(pid.to_string()).join(leaf)
     }
 
-    fn read_required_string(pid: i32, leaf: &str) -> Result<String, ProcError> {
+    fn read_required_text(
+        pid: i32,
+        leaf: &str,
+        affected_paths: &[&str],
+    ) -> Result<DecodedProcText, ProcError> {
         let path = proc_path(pid, leaf);
-        fs::read_to_string(&path).map_err(|error| map_process_io(error, pid, &path))
+        let bytes = fs::read(&path).map_err(|error| map_process_io(error, pid, &path))?;
+        Ok(decode_proc_text(&bytes, leaf, affected_paths))
     }
 
     fn read_required_bytes(pid: i32, leaf: &str) -> Result<Vec<u8>, ProcError> {
@@ -296,33 +460,49 @@ mod linux {
         fs::read(&path).map_err(|error| map_process_io(error, pid, &path))
     }
 
-    fn read_optional_string(pid: i32, leaf: &str) -> Result<Option<String>, ProcError> {
+    fn read_optional_text(
+        pid: i32,
+        leaf: &str,
+        affected_paths: &[&str],
+    ) -> Result<Option<DecodedProcText>, ProcError> {
         let path = proc_path(pid, leaf);
-        match fs::read_to_string(&path) {
-            Ok(content) => Ok(Some(content)),
+        match fs::read(&path) {
+            Ok(bytes) => Ok(Some(decode_proc_text(&bytes, leaf, affected_paths))),
             Err(error) if error.kind() == ErrorKind::NotFound => absent_or_gone(pid),
             Err(error) => Err(map_process_io(error, pid, &path)),
         }
     }
 
-    fn read_fd_names(pid: i32) -> Result<Vec<String>, ProcError> {
+    fn read_fd_count(pid: i32) -> Result<u32, ProcError> {
         let path = proc_path(pid, "fd");
         let entries = fs::read_dir(&path).map_err(|error| map_process_io(error, pid, &path))?;
-        let mut names = Vec::new();
+        let mut count = 0_u32;
         for entry in entries {
-            let entry = entry.map_err(|error| map_process_io(error, pid, &path))?;
-            names.push(os_string_to_utf8(entry.file_name(), "fd entry")?);
+            entry.map_err(|error| map_process_io(error, pid, &path))?;
+            count = count.checked_add(1).ok_or_else(|| ProcError::Parse {
+                what: "fd entry".into(),
+                reason: "fd 数量超过 u32".into(),
+            })?;
         }
-        Ok(names)
+        Ok(count)
     }
 
-    fn read_exe(pid: i32) -> Result<Option<String>, ProcError> {
+    fn read_exe(pid: i32) -> Result<Option<DecodedProcText>, ProcError> {
         let path = proc_path(pid, "exe");
         match fs::read_link(&path) {
-            Ok(target) => os_string_to_utf8(target.into_os_string(), "exe").map(Some),
+            Ok(target) => {
+                let bytes = target.into_os_string().into_vec();
+                Ok(Some(decode_proc_text(&bytes, "exe", EXE_LOSSY_PATHS)))
+            }
             Err(error) if error.kind() == ErrorKind::NotFound => absent_or_gone(pid),
             Err(error) => Err(map_process_io(error, pid, &path)),
         }
+    }
+
+    fn read_process_generation(pid: i32) -> Result<ProcessGeneration, ProcError> {
+        let stat = read_required_text(pid, "stat", STAT_LOSSY_PATHS)?;
+        let stat = parse_stat(&stat.value)?;
+        Ok(ProcessGeneration::from(&stat))
     }
 
     fn read_system_cpu() -> Result<crate::proc_view::SystemCpu, ProcError> {
@@ -349,13 +529,6 @@ mod linux {
             }
             Err(error) => Err(map_process_io(error, pid, &proc_dir)),
         }
-    }
-
-    fn os_string_to_utf8(value: OsString, what: &str) -> Result<String, ProcError> {
-        value.into_string().map_err(|value| ProcError::Parse {
-            what: what.into(),
-            reason: format!("非 UTF-8 路径：{value:?}"),
-        })
     }
 
     fn map_process_io(error: Error, pid: i32, path: &Path) -> ProcError {
@@ -398,6 +571,32 @@ mod tests {
 
     use super::*;
 
+    const CAPTURED_STAT: &[u8] = include_bytes!("../tests/fixtures/d7/stat/stat-running.txt");
+
+    fn invalid_utf8_capture() -> Vec<u8> {
+        let mut bytes = CAPTURED_STAT.to_vec();
+        let comm_start = bytes
+            .iter()
+            .position(|byte| *byte == b'(')
+            .expect("captured stat must contain comm")
+            + 1;
+        bytes[comm_start] = 0xff;
+        bytes
+    }
+
+    fn lossy_cases() -> [(&'static str, &'static [&'static str]); 8] {
+        [
+            ("stat", STAT_LOSSY_PATHS),
+            ("status", STATUS_LOSSY_PATHS),
+            ("maps", MAPS_LOSSY_PATHS),
+            ("wchan", WCHAN_LOSSY_PATHS),
+            ("stack", STACK_LOSSY_PATHS),
+            ("cgroup", CGROUP_LOSSY_PATHS),
+            ("exe", EXE_LOSSY_PATHS),
+            ("cmdline", CMDLINE_LOSSY_PATHS),
+        ]
+    }
+
     #[test]
     fn initial_and_final_cpu_pairs_read_process_then_system_adjacently() {
         let reads = RefCell::new(Vec::new());
@@ -438,6 +637,119 @@ mod tests {
                 "final_system",
             ]
         );
+    }
+
+    #[test]
+    fn invalid_utf8_is_replaced_and_mapped_to_every_affected_level0_path() {
+        let invalid = invalid_utf8_capture();
+
+        for (what, expected_paths) in lossy_cases() {
+            let decoded = decode_proc_text(&invalid, what, expected_paths);
+
+            assert!(decoded.value.contains('\u{fffd}'), "{what}");
+            assert_eq!(decoded.degradations.len(), expected_paths.len(), "{what}");
+            for (degradation, expected_path) in
+                decoded.degradations.iter().zip(expected_paths.iter())
+            {
+                assert_eq!(degradation.path, *expected_path, "{what}");
+                assert!(degradation.reason.contains(what), "{what}");
+                assert!(degradation.reason.contains("U+FFFD"), "{what}");
+            }
+        }
+    }
+
+    #[test]
+    fn genuine_replacement_character_is_valid_utf8_and_emits_no_degradation() {
+        let captured = std::str::from_utf8(CAPTURED_STAT).expect("captured stat is valid UTF-8");
+        let valid = format!("{captured}\u{fffd}");
+
+        for (what, affected_paths) in lossy_cases() {
+            let decoded = decode_proc_text(valid.as_bytes(), what, affected_paths);
+
+            assert!(decoded.value.ends_with('\u{fffd}'), "{what}");
+            assert!(decoded.degradations.is_empty(), "{what}");
+        }
+    }
+
+    #[test]
+    fn snapshot_generation_change_after_body_is_proc_not_found() {
+        let stat = crate::proc_view::parse_stat(
+            std::str::from_utf8(CAPTURED_STAT).expect("captured stat is valid UTF-8"),
+        )
+        .expect("captured stat must parse");
+        let initial = ProcessGeneration::from(&stat);
+        let reads = RefCell::new(Vec::new());
+
+        let error = with_stable_process_generation(
+            initial.pid,
+            initial,
+            || {
+                reads.borrow_mut().push("snapshot");
+                Ok::<_, ProcError>(())
+            },
+            || {
+                reads.borrow_mut().push("final_stat");
+                Ok(ProcessGeneration {
+                    start_time_ticks: initial.start_time_ticks + 1,
+                    ..initial
+                })
+            },
+        )
+        .expect_err("mid-snapshot PID generation change must fail");
+
+        assert_eq!(error, ProcError::ProcNotFound { pid: initial.pid });
+        assert_eq!(reads.into_inner(), ["snapshot", "final_stat"]);
+    }
+
+    #[test]
+    fn snapshot_pid_change_after_body_is_proc_not_found() {
+        let stat = crate::proc_view::parse_stat(
+            std::str::from_utf8(CAPTURED_STAT).expect("captured stat is valid UTF-8"),
+        )
+        .expect("captured stat must parse");
+        let initial = ProcessGeneration::from(&stat);
+
+        let error = with_stable_process_generation(
+            initial.pid,
+            initial,
+            || Ok::<_, ProcError>(()),
+            || {
+                Ok(ProcessGeneration {
+                    pid: initial.pid + 1,
+                    ..initial
+                })
+            },
+        )
+        .expect_err("mid-snapshot PID change must fail");
+
+        assert_eq!(error, ProcError::ProcNotFound { pid: initial.pid });
+    }
+
+    #[test]
+    fn matching_snapshot_generation_succeeds_after_final_stat_read() {
+        let stat = crate::proc_view::parse_stat(
+            std::str::from_utf8(CAPTURED_STAT).expect("captured stat is valid UTF-8"),
+        )
+        .expect("captured stat must parse");
+        let initial = ProcessGeneration::from(&stat);
+        let reads = RefCell::new(Vec::new());
+
+        let value = with_stable_process_generation(
+            initial.pid,
+            initial,
+            || {
+                reads.borrow_mut().push("snapshot");
+                Ok::<_, ProcError>("complete")
+            },
+            || {
+                reads.borrow_mut().push("final_stat");
+                Ok(initial)
+            },
+        )
+        .expect("matching PID generation must succeed");
+
+        assert_eq!(value, "complete");
+        assert_eq!(reads.into_inner(), ["snapshot", "final_stat"]);
     }
 
     #[test]
