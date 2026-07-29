@@ -22,7 +22,7 @@
 //!  └─ cost_hint   {token, api_cost?, overhead_est}  ← §12 已定形状
 //! ```
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 // ════════════════════════════════════════════════════════════════════════════
 // Level 0：恒定小体积，纯快照，零探针（§10）
@@ -31,8 +31,8 @@ use serde::{Deserialize, Serialize};
 /// §10 Level 0 —— introspect 一次返回的全部东西。
 ///
 /// 「恒定小体积、纯快照、零探针」是 §10 标题三词：体积恒定 (无论目标 GB 级 maps
-/// 都压成 mem_shape 的十几行)；快照 (一次原子读，不含本次调用引入的时间窗)；
-/// 零探针 (本次不新增探针、不 ptrace，纯读 `/proc`，见 §13.4 注释)。
+/// 都压成 mem_shape 的十几行)；快照 (顺序读取多个 `/proc` 文件形成的有界观察窗口，
+/// 不是原子读)；零探针 (本次不新增探针、不 ptrace，纯读 `/proc`，见 §13.4 注释)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Level0 {
     pub identity: Identity,
@@ -90,8 +90,8 @@ pub struct Cmdline {
 /// 它本身就是符号化过的 kernel 函数名（如 `futex_wait_queue_me`），不是裸地址。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcState {
-    /// `R|S|D|Z`，对应 /proc/<pid>/stat 的 state 字段。用 enum 强类型，避免
-    /// 字符串漂移。`T` 偶尔出现 (stopped)，这里单列。
+    /// 对应 `/proc/<pid>/stat` 的单字符 state 字段。已知内核状态强类型化，
+    /// 新状态保留原字符落到 [`RunState::Unknown`]，避免整次内省失败。
     pub run_state: RunState,
     pub last_cpu: u32,
     pub nr_threads: u32,
@@ -101,9 +101,8 @@ pub struct ProcState {
     pub wchan: Option<Symbolized>,
 }
 
-/// §10 `R|S|D|Z`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
+/// Linux `/proc/<pid>/stat` 的单字符运行状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
     /// Running / Runnable。
     R,
@@ -115,6 +114,66 @@ pub enum RunState {
     Z,
     /// Stopped (traced / stopped)。
     T,
+    /// Tracing stop。
+    TracingStop,
+    /// Dead。
+    X,
+    /// Parked。
+    P,
+    /// Idle kernel thread。
+    I,
+    /// Forward-compatible fallback for a state unknown to this build.
+    Unknown(char),
+}
+
+impl RunState {
+    pub const fn as_char(self) -> char {
+        match self {
+            RunState::R => 'R',
+            RunState::S => 'S',
+            RunState::D => 'D',
+            RunState::Z => 'Z',
+            RunState::T => 'T',
+            RunState::TracingStop => 't',
+            RunState::X => 'X',
+            RunState::P => 'P',
+            RunState::I => 'I',
+            RunState::Unknown(state) => state,
+        }
+    }
+
+    pub const fn from_char(state: char) -> Self {
+        match state {
+            'R' => RunState::R,
+            'S' => RunState::S,
+            'D' => RunState::D,
+            'Z' => RunState::Z,
+            'T' => RunState::T,
+            't' => RunState::TracingStop,
+            'X' => RunState::X,
+            'P' => RunState::P,
+            'I' => RunState::I,
+            state => RunState::Unknown(state),
+        }
+    }
+}
+
+impl Serialize for RunState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_char(self.as_char())
+    }
+}
+
+impl<'de> Deserialize<'de> for RunState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        char::deserialize(deserializer).map(RunState::from_char)
+    }
 }
 
 // ─── resource ───────────────────────────────────────────────────────────────
@@ -199,7 +258,8 @@ pub struct TopMap {
     pub end: String,
     pub size: u64,
     pub kind: MapKind,
-    /// 若 file-backed，原始路径片段（截断）。
+    /// 若 file-backed，producer 按固定 UTF-8 字节上限投影后的路径片段。
+    /// schema 只承载结果，不在序列化层执行截断。
     pub backing: Option<String>,
 }
 
@@ -516,8 +576,58 @@ mod tests {
     }
 
     #[test]
-    fn run_state_serializes_uppercase() {
-        let s = serde_json::to_string(&RunState::D).unwrap();
-        assert_eq!(s, "\"D\"");
+    fn run_state_serializes_as_exact_kernel_character() {
+        let states = [
+            (RunState::R, 'R'),
+            (RunState::S, 'S'),
+            (RunState::D, 'D'),
+            (RunState::Z, 'Z'),
+            (RunState::T, 'T'),
+            (RunState::TracingStop, 't'),
+            (RunState::X, 'X'),
+            (RunState::P, 'P'),
+            (RunState::I, 'I'),
+        ];
+        let mut encodings = std::collections::BTreeSet::new();
+
+        for (state, character) in states {
+            let serialized = serde_json::to_string(&state).unwrap();
+            let wire_value: String = serde_json::from_str(&serialized).unwrap();
+
+            assert_eq!(serialized, format!("\"{character}\""));
+            assert_eq!(wire_value.chars().count(), 1);
+            assert!(
+                encodings.insert(wire_value),
+                "known run states must have distinct wire encodings"
+            );
+            assert_eq!(
+                serde_json::from_str::<RunState>(&serialized).unwrap(),
+                state
+            );
+        }
+
+        assert_eq!(encodings.len(), states.len());
+    }
+
+    #[test]
+    fn unknown_run_state_roundtrips_without_becoming_an_error() {
+        let mut encodings = std::collections::BTreeSet::new();
+
+        for character in ['?', 'q'] {
+            let state = RunState::Unknown(character);
+            let serialized = serde_json::to_string(&state).unwrap();
+            let wire_value: String = serde_json::from_str(&serialized).unwrap();
+
+            assert_eq!(wire_value.chars().count(), 1);
+            assert!(encodings.insert(wire_value));
+            assert_eq!(
+                serde_json::from_str::<RunState>(&serialized).unwrap(),
+                state
+            );
+        }
+
+        assert_eq!(encodings.len(), 2);
+        assert!(serde_json::from_str::<RunState>("\"\"").is_err());
+        assert!(serde_json::from_str::<RunState>("\"??\"").is_err());
     }
 }
