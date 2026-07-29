@@ -100,6 +100,7 @@ FAKE_BIN="$TMP_ROOT/bin"
 PYTHON_MODULES="$TMP_ROOT/python-modules"
 RUNTIME="$TMP_ROOT/runtime"
 mkdir -p "$FAKE_BIN" "$PYTHON_MODULES" "$RUNTIME"
+chmod 700 "$RUNTIME"
 
 cat >"$FAKE_BIN/uname" <<'EOF'
 #!/bin/sh
@@ -202,6 +203,42 @@ run_case "zero memory is rejected" failure \
     "memory-mib is outside 1..1048576" run_check --memory-mib 0
 run_case "CPU count above range is rejected" failure \
     "cpus is outside 1..4096" run_check --cpus 4097
+
+MODE_755_PARENT="$TMP_ROOT/mode-755-parent"
+mkdir "$MODE_755_PARENT"
+chmod 755 "$MODE_755_PARENT"
+QMP_PATH_OVERRIDE="$MODE_755_PARENT/qmp.sock" run_case \
+    "mode 755 QMP parent is rejected" failure \
+    "parent directory must have mode 700" run_check
+
+MODE_750_PARENT="$TMP_ROOT/mode-750-parent"
+mkdir "$MODE_750_PARENT"
+chmod 750 "$MODE_750_PARENT"
+QMP_PATH_OVERRIDE="$MODE_750_PARENT/qmp.sock" run_case \
+    "mode 750 QMP parent is rejected" failure \
+    "parent directory must have mode 700" run_check
+
+INACCESSIBLE_PARENT="$TMP_ROOT/inaccessible-parent"
+mkdir "$INACCESSIBLE_PARENT"
+chmod 000 "$INACCESSIBLE_PARENT"
+QMP_PATH_OVERRIDE="$INACCESSIBLE_PARENT/qmp.sock" run_case \
+    "inaccessible QMP parent is rejected" failure \
+    "parent directory must have mode 700" run_check
+chmod 700 "$INACCESSIBLE_PARENT"
+
+SYMLINK_PARENT="$TMP_ROOT/symlink-parent"
+ln -s "$RUNTIME" "$SYMLINK_PARENT"
+QMP_PATH_OVERRIDE="$SYMLINK_PARENT/qmp.sock" run_case \
+    "QMP parent symlink is rejected" failure \
+    "parent directory is a symlink" run_check
+rm -f -- "$SYMLINK_PARENT"
+
+NON_DIRECTORY_PARENT="$TMP_ROOT/non-directory-parent"
+: >"$NON_DIRECTORY_PARENT"
+QMP_PATH_OVERRIDE="$NON_DIRECTORY_PARENT/qmp.sock" run_case \
+    "QMP parent non-directory is rejected" failure \
+    "parent path is not a directory" run_check
+rm -f -- "$NON_DIRECTORY_PARENT"
 
 DUPLICATE_PATH="$RUNTIME/duplicate"
 QMP_PATH_OVERRIDE="$DUPLICATE_PATH" PID_PATH_OVERRIDE="$DUPLICATE_PATH" run_case \
