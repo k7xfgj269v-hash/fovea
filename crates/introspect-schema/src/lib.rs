@@ -588,26 +588,46 @@ mod tests {
             (RunState::P, 'P'),
             (RunState::I, 'I'),
         ];
+        let mut encodings = std::collections::BTreeSet::new();
 
         for (state, character) in states {
             let serialized = serde_json::to_string(&state).unwrap();
+            let wire_value: String = serde_json::from_str(&serialized).unwrap();
+
             assert_eq!(serialized, format!("\"{character}\""));
+            assert_eq!(wire_value.chars().count(), 1);
+            assert!(
+                encodings.insert(wire_value),
+                "known run states must have distinct wire encodings"
+            );
             assert_eq!(
                 serde_json::from_str::<RunState>(&serialized).unwrap(),
                 state
             );
         }
+
+        assert_eq!(encodings.len(), states.len());
     }
 
     #[test]
     fn unknown_run_state_roundtrips_without_becoming_an_error() {
-        let state = RunState::Unknown('?');
-        let serialized = serde_json::to_string(&state).unwrap();
+        let mut encodings = std::collections::BTreeSet::new();
 
-        assert_eq!(serialized, "\"?\"");
-        assert_eq!(
-            serde_json::from_str::<RunState>(&serialized).unwrap(),
-            state
-        );
+        for character in ['?', 'q'] {
+            let state = RunState::Unknown(character);
+            let serialized = serde_json::to_string(&state).unwrap();
+            let wire_value: String = serde_json::from_str(&serialized).unwrap();
+
+            assert_eq!(wire_value.chars().count(), 1);
+            assert!(encodings.insert(wire_value));
+            assert_eq!(
+                serde_json::from_str::<RunState>(&serialized).unwrap(),
+                state
+            );
+        }
+
+        assert_eq!(encodings.len(), 2);
+        assert!(serde_json::from_str::<RunState>("\"\"").is_err());
+        assert!(serde_json::from_str::<RunState>("\"??\"").is_err());
     }
 }
