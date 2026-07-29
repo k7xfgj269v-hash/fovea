@@ -20,13 +20,17 @@ fn all_captured_run_states_parse_and_unknown_falls_back() {
         assert_eq!(parsed.state, RunState::from_char(state));
     }
 
+    for unknown_state in ['?', 'q', '~'] {
+        let mut unknown = stat_fixture('S');
+        let state_offset = stat_state_offset(&unknown);
+        unknown[state_offset] = unknown_state as u8;
+        let parsed = parse_stat(std::str::from_utf8(&unknown).unwrap())
+            .expect("unknown nonempty state must not fail the whole snapshot");
+        assert_eq!(parsed.state, RunState::Unknown(unknown_state));
+    }
+
     let mut unknown = stat_fixture('S');
     let state_offset = stat_state_offset(&unknown);
-    unknown[state_offset] = b'?';
-    let parsed = parse_stat(std::str::from_utf8(&unknown).unwrap())
-        .expect("unknown nonempty state must not fail the whole snapshot");
-    assert_eq!(parsed.state, RunState::Unknown('?'));
-
     unknown.remove(state_offset);
     match parse_stat(std::str::from_utf8(&unknown).unwrap()) {
         Err(ProcError::Parse { what, reason }) => {
@@ -128,9 +132,9 @@ fn maps_require_exact_permissions_pattern() {
     assert_eq!(clean.valid_line_count, 1);
     assert_eq!(clean.skipped_line_count, 0);
 
-    for index in 0..4 {
+    for (index, invalid_byte) in [(0, b'x'), (1, b'x'), (2, b'w'), (3, b'x')] {
         let mut mutated = captured.clone();
-        mutated[perms_offset + index] = b'q';
+        mutated[perms_offset + index] = invalid_byte;
         let parsed = parse_maps_with_diagnostics(std::str::from_utf8(&mutated).unwrap()).unwrap();
         assert_eq!(parsed.valid_line_count, 0, "perms byte {index}");
         assert_eq!(parsed.skipped_line_count, 1, "perms byte {index}");
@@ -139,16 +143,48 @@ fn maps_require_exact_permissions_pattern() {
             "skipped 1 malformed maps lines"
         );
     }
+
+    for mutated_len in [3usize, 5usize] {
+        let mut mutated = captured.clone();
+        if mutated_len == 3 {
+            mutated.remove(perms_offset + 3);
+        } else {
+            mutated.insert(perms_offset + 4, b'p');
+        }
+        let parsed = parse_maps_with_diagnostics(std::str::from_utf8(&mutated).unwrap()).unwrap();
+        assert_eq!(
+            parsed.valid_line_count, 0,
+            "permissions length {mutated_len}"
+        );
+        assert_eq!(
+            parsed.skipped_line_count, 1,
+            "permissions length {mutated_len}"
+        );
+    }
+
+    for valid_permissions in [b"---p", b"---s", b"rwxp", b"rwxs"] {
+        let mut mutated = captured.clone();
+        mutated[perms_offset..perms_offset + 4].copy_from_slice(valid_permissions);
+        let parsed = parse_maps_with_diagnostics(std::str::from_utf8(&mutated).unwrap()).unwrap();
+        assert_eq!(
+            parsed.valid_line_count, 1,
+            "permissions {valid_permissions:?}"
+        );
+        assert_eq!(
+            parsed.skipped_line_count, 0,
+            "permissions {valid_permissions:?}"
+        );
+    }
 }
 
 #[test]
 fn captured_top_map_backing_boundaries_preserve_path_bytes() {
     for (marker, expected_len) in [
-        (b"/short-file".as_slice(), 38usize),
-        (b"/ascii255/".as_slice(), 249usize),
-        (b"/ascii256/".as_slice(), 241usize),
-        (b"/ascii257/".as_slice(), 236usize),
-        (b"/trailing-space ".as_slice(), 43usize),
+        (b"/short-file".as_slice(), 35usize),
+        (b"ascii255-".as_slice(), 255usize),
+        (b"ascii256-".as_slice(), 256usize),
+        (b"/trailing-space ".as_slice(), 40usize),
+        (b"/trailing-tab\t".as_slice(), 38usize),
     ] {
         let line = captured_boundary_line(marker);
         let expected = captured_path(&line);
@@ -159,7 +195,22 @@ fn captured_top_map_backing_boundaries_preserve_path_bytes() {
         assert!(parsed.degradations.is_empty());
     }
 
-    let multibyte = captured_boundary_line(b"/multibyte/");
+    let ascii257 = captured_boundary_line(b"ascii257-");
+    let expected = captured_path(&ascii257);
+    assert_eq!(expected.len(), TOP_MAP_BACKING_MAX_BYTES + 1);
+    let parsed = parse_maps_with_diagnostics(std::str::from_utf8(&ascii257).unwrap()).unwrap();
+    assert_eq!(
+        only_backing(&parsed),
+        &expected[..TOP_MAP_BACKING_MAX_BYTES]
+    );
+    assert_eq!(parsed.degradations.len(), 1);
+    assert_eq!(parsed.degradations[0].path, "mem_shape.top_n[0].backing");
+    assert_eq!(
+        parsed.degradations[0].reason,
+        "backing truncated from 257 to 256 UTF-8 bytes"
+    );
+
+    let multibyte = captured_boundary_line(b"/multibyte-");
     let expected = captured_path(&multibyte);
     assert_eq!(expected.len(), TOP_MAP_BACKING_MAX_BYTES + 1);
     assert!(expected.is_char_boundary(254));
@@ -180,11 +231,7 @@ fn captured_top_map_backing_boundaries_preserve_path_bytes() {
     )
     .ends_with(' '));
 
-    let mut trailing_tab = trailing_space;
-    let newline = trailing_tab.len() - 1;
-    assert_eq!(trailing_tab[newline], b'\n');
-    assert_eq!(trailing_tab[newline - 1], b' ');
-    trailing_tab[newline - 1] = b'\t';
+    let trailing_tab = captured_boundary_line(b"/trailing-tab\t");
     assert!(only_backing(
         &parse_maps_with_diagnostics(std::str::from_utf8(&trailing_tab).unwrap()).unwrap()
     )
@@ -240,7 +287,7 @@ fn cgroup_fixture_manifest_records_capture_provenance() {
         .find(|record| record.path == "maps/boundaries-beijing.txt")
         .unwrap();
     assert_eq!(maps.kind, "proc_maps");
-    assert_eq!(maps.captured_at, "2026-07-29T15:49:42Z");
+    assert_eq!(maps.captured_at, "2026-07-29T17:17:13Z");
     assert_eq!(maps.kernel_release, "5.15.0-171-generic");
     assert_eq!(maps.architecture, "x86_64");
     assert_eq!(
@@ -249,7 +296,7 @@ fn cgroup_fixture_manifest_records_capture_provenance() {
     );
     assert_eq!(
         maps.sha256,
-        "6bf32f82b7ed40246df0ad96756943bf05435ff14826e8b0729ce3c6e2086317"
+        "d93a35d5a7f2f1e479641f1ca1f7da285ae0311458a0115d4a93b10dfb13be3a"
     );
     assert_eq!(maps.provenance.kind, "captured");
     assert_eq!(maps.provenance.source, None);

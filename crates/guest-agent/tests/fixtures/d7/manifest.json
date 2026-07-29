@@ -169,12 +169,12 @@
     {
       "path": "maps/boundaries-beijing.txt",
       "kind": "proc_maps",
-      "captured_at": "2026-07-29T15:49:42Z",
+      "captured_at": "2026-07-29T17:17:13Z",
       "kernel_release": "5.15.0-171-generic",
       "architecture": "x86_64",
       "command": "python3 mmap boundary capture; read /proc/self/maps",
       "state": null,
-      "sha256": "6bf32f82b7ed40246df0ad96756943bf05435ff14826e8b0729ce3c6e2086317",
+      "sha256": "d93a35d5a7f2f1e479641f1ca1f7da285ae0311458a0115d4a93b10dfb13be3a",
       "provenance": {
         "kind": "captured",
         "source": null,
