@@ -175,6 +175,10 @@ cleanup_on_exit() {
         wait "$qemu_pid" >/dev/null 2>&1 || true
         qemu_pid=
     fi
+    if ((qemu_stdin_saved)); then
+        exec 3<&-
+        qemu_stdin_saved=0
+    fi
     release_launch_locks
     exit "$status"
 }
@@ -195,6 +199,10 @@ forward_signal() {
             child_status=$?
         fi
         qemu_pid=
+    fi
+    if ((qemu_stdin_saved)); then
+        exec 3<&-
+        qemu_stdin_saved=0
     fi
     release_launch_locks
     trap - EXIT
@@ -228,6 +236,7 @@ dry_run=0
 append_parts=()
 launch_locks=()
 qemu_pid=
+qemu_stdin_saved=0
 
 while (($# > 0)); do
     case "$1" in
@@ -411,8 +420,14 @@ if ((dry_run)); then
     exit 0
 fi
 
-"${qemu_argv[@]}" &
+if ! exec 3<&0; then
+    die "failed to preserve QEMU stdin"
+fi
+qemu_stdin_saved=1
+"${qemu_argv[@]}" <&3 &
 qemu_pid=$!
+exec 3<&-
+qemu_stdin_saved=0
 if wait "$qemu_pid"; then
     qemu_status=0
 else

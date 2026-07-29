@@ -324,6 +324,34 @@ else
     sed 's/^/  stderr: /' "$TMP_ROOT/dry-run.stderr" >&2
 fi
 
+STDIN_QEMU="$FAKE_BIN/qemu-stdin"
+cat >"$STDIN_QEMU" <<'EOF'
+#!/bin/sh
+IFS= read -r token || exit 1
+[ "$token" = fovea-stdin-test ] || exit 2
+EOF
+chmod +x "$STDIN_QEMU"
+
+tests=$((tests + 1))
+stdin_name="attached QEMU stdin is preserved"
+STDIN_QMP="$RUNTIME/stdin.qmp.sock"
+STDIN_PIDFILE="$RUNTIME/stdin.pid"
+STDIN_PORT=$(free_port)
+if printf 'fovea-stdin-test\n' |
+    QEMU_OVERRIDE="$STDIN_QEMU" \
+    run_vm_fixture \
+        --kernel "$KERNEL" \
+        --qmp-socket "$STDIN_QMP" \
+        --pidfile "$STDIN_PIDFILE" \
+        --gdb-port "$STDIN_PORT" \
+        --guest-cid 15 \
+        >"$TMP_ROOT/stdin.stdout" 2>"$TMP_ROOT/stdin.stderr"; then
+    printf 'ok %d - %s\n' "$tests" "$stdin_name"
+else
+    fail "$stdin_name"
+    sed 's/^/  stderr: /' "$TMP_ROOT/stdin.stderr" >&2
+fi
+
 WAIT_QEMU="$FAKE_BIN/qemu-wait"
 cat >"$WAIT_QEMU" <<'EOF'
 #!/bin/sh
