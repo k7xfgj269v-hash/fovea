@@ -209,6 +209,10 @@ forward_signal() {
     exit "$child_status"
 }
 
+defer_launch_signal() {
+    launch_signal=$1
+}
+
 acquire_launch_lock() {
     local lock_path=$1
     local diagnostic_path=${2:-$1}
@@ -237,6 +241,7 @@ append_parts=()
 launch_locks=()
 qemu_pid=
 qemu_stdin_saved=0
+launch_signal=
 
 while (($# > 0)); do
     case "$1" in
@@ -424,10 +429,29 @@ if ! exec 3<&0; then
     die "failed to preserve QEMU stdin"
 fi
 qemu_stdin_saved=1
-"${qemu_argv[@]}" <&3 &
+trap 'defer_launch_signal TERM' TERM
+trap 'defer_launch_signal INT' INT
+(
+    trap - TERM INT
+    exec "${qemu_argv[@]}"
+) <&3 &
 qemu_pid=$!
 exec 3<&-
 qemu_stdin_saved=0
+trap 'forward_signal TERM 143' TERM
+trap 'forward_signal INT 130' INT
+if [[ -n "$launch_signal" ]]; then
+    pending_signal=$launch_signal
+    launch_signal=
+    case "$pending_signal" in
+        TERM)
+            forward_signal TERM 143
+            ;;
+        INT)
+            forward_signal INT 130
+            ;;
+    esac
+fi
 if wait "$qemu_pid"; then
     qemu_status=0
 else

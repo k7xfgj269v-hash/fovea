@@ -352,6 +352,103 @@ else
     sed 's/^/  stderr: /' "$TMP_ROOT/stdin.stderr" >&2
 fi
 
+RACE_QEMU="$FAKE_BIN/qemu-startup-signal"
+cat >"$RACE_QEMU" <<'EOF'
+#!/bin/sh
+RACE_QEMU_PID_FILE=${FAKE_QEMU_PID_FILE:?}
+RACE_QEMU_TERM_RECEIVED=${FAKE_QEMU_TERM_RECEIVED:?}
+RACE_QEMU_READY=${FAKE_QEMU_READY:?}
+
+handle_term() {
+    : >"$RACE_QEMU_TERM_RECEIVED"
+    exit 143
+}
+
+trap handle_term TERM INT
+printf '%s\n' "$$" >"$RACE_QEMU_PID_FILE"
+kill -TERM "$PPID"
+: >"$RACE_QEMU_READY"
+while :; do
+    sleep 0.01
+done
+EOF
+chmod +x "$RACE_QEMU"
+
+tests=$((tests + 1))
+race_name="startup TERM is deferred until QEMU has a PID"
+RACE_QMP="$RUNTIME/startup-signal.qmp.sock"
+RACE_PIDFILE="$RUNTIME/startup-signal.pid"
+RACE_PORT=$(free_port)
+RACE_READY="$TMP_ROOT/startup-signal.ready"
+RACE_TERM_RECEIVED="$TMP_ROOT/startup-signal.term-received"
+RACE_QEMU_PID_FILE="$TMP_ROOT/startup-signal.qemu-pid"
+RACE_STDOUT="$TMP_ROOT/startup-signal.stdout"
+RACE_STDERR="$TMP_ROOT/startup-signal.stderr"
+RACE_WRAPPER_PID=
+RACE_QEMU_PID=
+RACE_STATUS=
+rm -f -- "$RACE_READY" "$RACE_TERM_RECEIVED" "$RACE_QEMU_PID_FILE"
+
+(
+    exec env \
+        TMPDIR="$PRIVATE_TMPDIR" \
+        FOVEA_LOCK_ROOT="$GLOBAL_LOCK_ROOT" \
+        PYTHONPATH="$PYTHON_MODULES${PYTHONPATH:+:$PYTHONPATH}" \
+        UNAME_BIN="$FAKE_BIN/uname" \
+        QEMU_BIN="$RACE_QEMU" \
+        KVM_DEVICE="$KVM_FILE" \
+        PYTHON_BIN="$PYTHON" \
+        FAKE_QEMU_READY="$RACE_READY" \
+        FAKE_QEMU_TERM_RECEIVED="$RACE_TERM_RECEIVED" \
+        FAKE_QEMU_PID_FILE="$RACE_QEMU_PID_FILE" \
+        "$RUN_VM" \
+        --kernel "$KERNEL" \
+        --qmp-socket "$RACE_QMP" \
+        --pidfile "$RACE_PIDFILE" \
+        --gdb-port "$RACE_PORT" \
+        --guest-cid 17
+) >"$RACE_STDOUT" 2>"$RACE_STDERR" &
+RACE_WRAPPER_PID=$!
+PIDS[${#PIDS[@]}]=$RACE_WRAPPER_PID
+
+race_pass=1
+if ! wait_for_file "$RACE_QEMU_PID_FILE" "$RACE_WRAPPER_PID"; then
+    fail "$race_name (fake QEMU did not start)"
+    sed 's/^/  stderr: /' "$RACE_STDERR" >&2
+    race_pass=0
+else
+    RACE_QEMU_PID=$(sed -n '1p' "$RACE_QEMU_PID_FILE")
+    if wait "$RACE_WRAPPER_PID"; then
+        RACE_STATUS=0
+    else
+        RACE_STATUS=$?
+    fi
+    forget_pid "$RACE_WRAPPER_PID"
+    if ((RACE_STATUS != 143)); then
+        fail "$race_name (expected status 143, got $RACE_STATUS)"
+        race_pass=0
+    elif [[ ! -e "$RACE_TERM_RECEIVED" ]]; then
+        fail "$race_name (TERM did not reach QEMU)"
+        race_pass=0
+    elif [[ -n "$RACE_QEMU_PID" ]] &&
+        kill -0 "$RACE_QEMU_PID" >/dev/null 2>&1; then
+        fail "$race_name (QEMU child is still alive)"
+        race_pass=0
+    fi
+fi
+if [[ -n "$RACE_QEMU_PID" ]] &&
+    kill -0 "$RACE_QEMU_PID" >/dev/null 2>&1; then
+    kill -TERM "$RACE_QEMU_PID" >/dev/null 2>&1 || true
+fi
+if kill -0 "$RACE_WRAPPER_PID" >/dev/null 2>&1; then
+    kill -TERM "$RACE_WRAPPER_PID" >/dev/null 2>&1 || true
+    wait "$RACE_WRAPPER_PID" >/dev/null 2>&1 || true
+    forget_pid "$RACE_WRAPPER_PID"
+fi
+if ((race_pass)); then
+    printf 'ok %d - %s\n' "$tests" "$race_name"
+fi
+
 WAIT_QEMU="$FAKE_BIN/qemu-wait"
 cat >"$WAIT_QEMU" <<'EOF'
 #!/bin/sh
