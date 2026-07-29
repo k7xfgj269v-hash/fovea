@@ -64,7 +64,7 @@ pub fn introspect(pid: i32) -> Result<Level0, ProcError> {
     {
         use crate::proc_source::LinuxProcSource;
 
-        return IntrospectService::new(
+        IntrospectService::new(
             Arc::new(LinuxProcSource::new()),
             Arc::new(FallbackSymbolizer),
             Arc::new(ThreadSampleClock),
@@ -90,7 +90,7 @@ pub fn introspect_with(pid: i32, symbolizer: &dyn Symbolizer) -> Result<Level0, 
 
         let source = LinuxProcSource::new();
         let clock = ThreadSampleClock;
-        return introspect_from_ports(&source, symbolizer, &clock, DEFAULT_SAMPLE_INTERVAL, pid);
+        introspect_from_ports(&source, symbolizer, &clock, DEFAULT_SAMPLE_INTERVAL, pid)
     }
 
     #[cfg(not(target_os = "linux"))]

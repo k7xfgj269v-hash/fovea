@@ -8,7 +8,7 @@
 
 > 把一台 Unix 机器改造成 AI 的「玻璃盒」——人照常用 shell，额外给 AI 一层能全内省、可操作内核的系统接口面。
 >
-> **状态**：设计收敛、骨架启动、M1 第一/第二刀已落。完整设计见 [`docs/DESIGN.md`](docs/DESIGN.md)。
+> **状态**：设计收敛、可执行的 M0 宿主 harness 与 M1 读侧形态已落。完整设计见 [`docs/DESIGN.md`](docs/DESIGN.md)。
 
 ## 这是什么
 
@@ -70,8 +70,8 @@ guest-agent 与 host-supervisor 互不引用——跨边界契约只由 `introsp
 
 | 里程碑 | 做什么 | 证明了什么 | 状态 |
 |---|---|---|---|
-| **M0** | VM harness：宿主+靶机、vsock、savevm/loadvm、gdb stub | 基座能跑、能秒回滚、能调内核 | ⬜ 未动 |
-| **M1** | 只读 `introspect(pid)` Level 0：/proc + blazesym，零探针 | 投影成立（GB maps → 十几行） | ✅ 形态全长齐 |
+| **M0** | VM harness：宿主+靶机、vsock、savevm/loadvm、gdb stub | 可执行的 preflight/启动/QMP/GDB/PT 工具；物理 Linux 验收另行完成 | 🟡 harness 已落 |
+| **M1** | 只读 `introspect(pid)` Level 0：/proc + blazesym，零探针 | 投影成立（GB maps → 十几行） | ✅ 读侧形态完整 |
 | **M2** | MCP front：introspect 包成 MCP tool + 自描述目录 | 能力面形态成立 | ⬜ |
 | **M3** | introspect Level 1 views + cost_hint + 置信度 | 投影/分页/成本可调度 | ⬜ |
 | **M4** | 飞行记录仪：常驻 ring buffer，极低扰动 | 瞬态事件抓得到 | ⬜ |
@@ -83,32 +83,38 @@ guest-agent 与 host-supervisor 互不引用——跨边界契约只由 `introsp
 
 ## 关键的诚实
 
-**M1 已落的是「形态」**——纯函数解析层 + 引擎组装在 Mac 单测里跑通，真 `/proc` I/O cfg-gate 到 Linux 才编；blazesym 的真内核态路径（`vmlinux`/`kallsyms` 路径配置）仍标 `TODO(M0)`，等 VM 基座搭起来一次性补。
+**M1 已落的是「形态」**——纯函数解析层 + 引擎组装。真 `/proc` I/O 只在 Linux `cfg` 下编译；默认兼容入口仍使用诚实的 `FallbackSymbolizer`，Linux-only 的 blazesym 后端保持独立骨架。M1 的解析契约现在从 `/proc/<pid>/status` 读取上下文切换数，按 UTF-8 边界截断不可信 cmdline，并在帧符号化失败时降低置信度。
 
-本地**无 Rust 工具链**，以上均为静态审读、未经 `cargo check`/`cargo test`。**CI（GitHub Actions, ubuntu）现在提供第一次真实编译**——包括 Mac 上永远 cfg-out、从没编过的 `#[cfg(target_os = "linux")]` 路径（`BlazeSymbolizer`、真 `/proc` I/O）。看上方徽章。
+仓库在 [`rust-toolchain.toml`](rust-toolchain.toml) 中固定 Rust stable。本机 `cargo fmt`、全 workspace 测试和严格 Clippy 均已通过。GitHub Actions 同时覆盖 macOS 可移植测试与 Ubuntu Linux 路径，包括 Mac 目标不会编译进来的 `#[cfg(target_os = "linux")]` 代码。
 
-> ⚠️ **CI 现在是红的——预期之内。** 首次 Linux 编译逐出 40 个错，全在 WIP 的 `BlazeSymbolizer` 后端：blazesym 0.2.5 的 `Symbolizer` 是 `!Send + !Sync`（内部 `RefCell`/`Rc`），与本项目 `Symbolizer: Send + Sync` trait 冲突；外加一处 API 路径搬家（`Source`）和下方的 `ctxt_switches` 字段债务。M1 实际用的 `FallbackSymbolizer` 路径不受影响。blazesym 后端在 M0 接入——在那之前徽章保持红色。
+**当前边界**：
 
-**已知缺口（本轮审出的 M1 债务，M0 端到端前修）**：
-
-- **`resource.ctxt_switches` 取错源**：读的是 `/proc/<pid>/stat` 字段 40/41，而那是 `rt_priority`/`policy`，**不是**上下文切换数——真源在 `/proc/<pid>/status` 的 `voluntary_ctxt_switches:` 行。真 Linux 上会静默给错数；Mac 单测用同构 fixture（把值放进 idx 37/38）恰好测不出。
-- **`build_cmdline` 可 panic**：`String::truncate(256)` 落在非 UTF-8 字符边界会 panic；cmdline 是不可信输入，含多字节字符时可触发。
-- **`confidence` 只做了一半**：实现了 §11 ①（wchan/顶帧交叉验证），未实现 ②（每帧符号化失败入 `low_fields`）。M1 用 Fallback 时每帧都符号化失败，`overall` 却报 1.0——与公理 11「告诉你它有多不确定」相悖。
-
-> 讽刺点：这三条都是「读侧静默污染」（§11）——引擎自己先踩了它要防的坑。均不阻塞编译，M0 前修。
+- M0 脚本是可执行 harness，不等于物理验收。仍需在具备真实 KVM、明确 guest artifact，并能记录 QMP/GDB/guest-PT 证据的 Linux x86_64 主机上验收；Apple Silicon 和 CI 都不等价于 M0 硬件证据。见 [`docs/M0.md`](docs/M0.md)。
+- `BlazeSymbolizer` 仅 Linux 编译，尚未接入默认的 M1 兼容路径；真实 `vmlinux`/`kallsyms` 配置仍属于 M0 集成任务。
+- 写侧语义污染仍是开放设计风险；当前实现没有暴露 eBPF 干预或 LKM 写能力。
 
 ## 怎么跑
 
 需要 Rust stable 工具链（edition 2021）。固定版本见 [`rust-toolchain.toml`](rust-toolchain.toml)。
 
 ```bash
-cargo check --all-targets    # 编译全部 4 crate（含 bin stub）
-cargo test                   # 跑单测（schema + vsock + guest-agent + host-supervisor）
+cargo check --locked --all-targets --all-features
+cargo test --locked --all
+cargo fmt --all --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo run -p guest-agent     # bin stub，当前无 daemon 逻辑
 cargo run -p host-supervisor # bin stub，当前无 listener
 ```
 
-> 非 Linux（含 Mac）上 `introspect()` cfg-gate 直接返 `NotImplemented`，不真读 `/proc`；纯函数形态由 `introspect_with_inputs` 在单测里盯住——这是「cfg-gate 到 Linux，但 Level0 组装形态在 Mac 单测」这一刀的实现。
+> 非 Linux（含 Mac）上 `introspect()` cfg-gate 直接返 `UnsupportedPlatform`，不真读 `/proc`；纯函数形态由 `introspect_with_inputs` 在单测里盯住——这是「cfg-gate 到 Linux，但 Level0 组装形态在 Mac 单测」这一刀的实现。
+
+M0 合同测试不依赖 Cargo，可直接运行：
+
+```bash
+scripts/m0/tests/test-check-host.sh
+scripts/m0/tests/test-run-vm.sh
+python3 scripts/m0/tests/test-qmp-smoke.py
+```
 
 ## 怎么读
 
@@ -123,10 +129,11 @@ cargo run -p host-supervisor # bin stub，当前无 listener
 
 ## 下一步
 
-按 `docs/DESIGN.md` §15 留的路径（**0 号插队**：先清上面 3 条 M1 债务，尤其 `ctxt_switches`——M0 一上真 Linux 就冒静默错数）：
+按 `docs/DESIGN.md` §15 留的路径：
 
-1. **M0 VM 基座**：QEMU/KVM + virtio-vsock + savevm/loadvm + gdb stub；之后 `vsock` 的真 `Transport` 实现就位，替掉 `MockTransport`，blazesym 的真内核态路径（`vmlinux`/`kallsyms`）一次性配置，`introspect` 在靶机内端到端跑通。
-2. **M2 MCP front**：把 `introspect` 包成 MCP tool + 自描述目录（§13.8 副作用等级一等字段）。
-3. **M5 纳真**：append-only 文件 sink + 真人审门 + 事前干预 hook（M7 伸手前栅栏先在位）——公理 13 的全落地。
+1. **M0 物理验收**：在合格的 Linux x86_64 KVM 主机上运行 harness，记录 QMP 快照、GDB、virtio-vsock 和 guest-PT 证据。
+2. **M0 集成**：用真实 vsock transport 替换 `MockTransport`，并在靶机内配置 blazesym 的 `vmlinux`/`kallsyms` 路径。
+3. **M2 MCP front**：把 `introspect` 包成 MCP tool + 自描述目录（§13.8 副作用等级一等字段）。
+4. **M5 加固**：在任何写能力之前落地 append-only 文件 sink、真人审门和事前干预 hook。
 
 > 顺序铁律（§13.9 / 公理 13）：**先造牢笼——含事前那道栅栏——AI 才被允许伸手。别让任何写能力 predate 它的容器。**

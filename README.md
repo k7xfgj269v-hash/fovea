@@ -8,7 +8,7 @@
 
 > Turn one Unix box into a **glass box** for AI — humans keep using the shell as usual, while an extra system-interface surface lets an AI fully introspect and operate the kernel.
 >
-> **Status**: design converged, skeleton up, the first two cuts of M1 have landed. Full design in [`docs/DESIGN.md`](docs/DESIGN.md).
+> **Status**: design converged, the executable M0 host harness and the M1 read-side shape have landed. Full design in [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## What it is
 
@@ -70,8 +70,8 @@ Safety scaffold before write capability — see [`docs/DESIGN.md`](docs/DESIGN.m
 
 | Milestone | What it builds | What it proves | Status |
 |---|---|---|---|
-| **M0** | VM harness: host + guest, vsock, `savevm`/`loadvm`, gdb stub | base runs, rolls back in a snap, can debug the kernel | ⬜ not started |
-| **M1** | read-only `introspect(pid)` Level 0: `/proc` + blazesym, zero probes | projection holds (GB maps → a dozen lines) | ✅ shape complete |
+| **M0** | VM harness: host + guest, vsock, `savevm`/`loadvm`, gdb stub | executable preflight/launch/QMP/GDB/PT tooling; physical Linux acceptance remains separate | 🟡 harness landed |
+| **M1** | read-only `introspect(pid)` Level 0: `/proc` + blazesym, zero probes | projection holds (GB maps → a dozen lines) | ✅ read-side shape complete |
 | **M2** | MCP front: `introspect` as an MCP tool + self-describing catalog | the capability surface takes shape | ⬜ |
 | **M3** | `introspect` Level 1 views + `cost_hint` + confidence | projection / paging / cost become schedulable | ⬜ |
 | **M4** | flight recorder: resident ring buffer, ultra-low perturbation | transient events get caught | ⬜ |
@@ -83,32 +83,38 @@ Safety scaffold before write capability — see [`docs/DESIGN.md`](docs/DESIGN.m
 
 ## Honest status
 
-**What M1 actually landed is the *shape*** — a pure-function parsing layer plus engine assembly, running green in Mac unit tests. The real `/proc` I/O is `cfg`-gated to Linux and only compiles there; blazesym's real kernel-side path (`vmlinux` / `kallsyms` config) is still marked `TODO(M0)`, to be filled in once the VM base exists.
+**What M1 landed is the *shape*** — a pure-function parsing layer plus engine assembly. The real `/proc` I/O is `cfg`-gated to Linux; the default compatibility entry point still uses the honest `FallbackSymbolizer`, while the Linux-only blazesym backend remains a separately isolated skeleton. The M1 parser contracts now source context-switch counts from `/proc/<pid>/status`, truncate untrusted command lines on UTF-8 boundaries, and lower confidence when frame symbolization fails.
 
-Locally there is **no Rust toolchain**, so everything above was static review, never `cargo check`/`cargo test`. **CI (GitHub Actions, ubuntu) now provides the first real compilation** — including, for the first time, the `#[cfg(target_os = "linux")]` paths (`BlazeSymbolizer`, the real `/proc` I/O) that never compile on Mac. Watch the badge above.
+The repository pins Rust stable in [`rust-toolchain.toml`](rust-toolchain.toml). Local `cargo fmt`, all workspace tests, and strict Clippy pass on macOS. GitHub Actions covers both macOS portable tests and the Ubuntu Linux paths, including the `#[cfg(target_os = "linux")]` code that does not compile into the macOS target.
 
-> ⚠️ **CI is red right now — by design.** That first Linux compile surfaced 40 errors, all in the WIP `BlazeSymbolizer` backend: blazesym 0.2.5's `Symbolizer` is `!Send + !Sync` (interior `RefCell`/`Rc`), clashing with our `Symbolizer: Send + Sync` trait; plus a moved API path (`Source`) and the `ctxt_switches` field debt below. The `FallbackSymbolizer` path that M1 actually uses is unaffected. The blazesym backend gets wired in at M0 — the badge stays red until then.
+**Current boundaries**:
 
-**Known gaps** (M1 debts found in review, to fix before the M0 end-to-end):
-
-- **`resource.ctxt_switches` reads the wrong source** — it reads `/proc/<pid>/stat` fields 40/41, which are `rt_priority`/`policy`, **not** context-switch counts. The real source is the `voluntary_ctxt_switches:` line in `/proc/<pid>/status`. On real Linux this silently returns wrong numbers; the Mac unit test uses an isomorphic fixture (values placed at idx 37/38) that happens to miss it.
-- **`build_cmdline` can panic** — `String::truncate(256)` on a non-UTF-8 char boundary panics; `cmdline` is untrusted input and can trigger this with multi-byte characters.
-- **`confidence` is only half done** — §11 ① (wchan / top-frame cross-check) is implemented, ② (each frame's symbolization failure into `low_fields`) is not. Under M1's `Fallback` every frame fails to symbolize, yet `overall` reports `1.0` — contradicting axiom 11 ("tell you how uncertain it is").
-
-> The irony: all three are "silent read-side contamination" (§11) — the engine tripped over the very pit it is meant to guard. None block compilation; fix before M0.
+- The M0 scripts are an executable harness, not physical acceptance. A qualifying Linux x86_64 host with real KVM, explicit guest artifacts, and recorded QMP/GDB/guest-PT evidence is still required; Apple Silicon and CI are not equivalent M0 hardware evidence. See [`docs/M0.md`](docs/M0.md).
+- `BlazeSymbolizer` is Linux-only and not wired into the default M1 compatibility path. Its real `vmlinux`/`kallsyms` configuration is still an M0 integration task.
+- Write-side semantic contamination remains an open design risk. No eBPF intervention or LKM write capability is exposed by the current implementation.
 
 ## Build & run
 
 Requires the Rust stable toolchain (edition 2021). The pinned toolchain lives in [`rust-toolchain.toml`](rust-toolchain.toml).
 
 ```bash
-cargo check --all-targets    # compile all 4 crates (incl. bin stubs)
-cargo test                   # unit tests (schema + vsock + guest-agent + host-supervisor)
+cargo check --locked --all-targets --all-features
+cargo test --locked --all
+cargo fmt --all --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo run -p guest-agent     # bin stub — no daemon logic yet
 cargo run -p host-supervisor # bin stub — no listener yet
 ```
 
-> On non-Linux (incl. Mac), `introspect()` `cfg`-gates straight to `NotImplemented` and never touches `/proc`; the pure-function shape is held by `introspect_with_inputs` in unit tests — that is the realization of "`cfg`-gate to Linux, but hold the Level0 assembly shape in Mac unit tests".
+> On non-Linux (incl. Mac), `introspect()` `cfg`-gates straight to `UnsupportedPlatform` and never touches `/proc`; the pure-function shape is held by `introspect_with_inputs` in unit tests — that is the realization of "`cfg`-gate to Linux, but hold the Level0 assembly shape in Mac unit tests".
+
+The M0 contract tests are independent of Cargo and can be run directly:
+
+```bash
+scripts/m0/tests/test-check-host.sh
+scripts/m0/tests/test-run-vm.sh
+python3 scripts/m0/tests/test-qmp-smoke.py
+```
 
 ## Reading guide
 
@@ -123,10 +129,11 @@ cargo run -p host-supervisor # bin stub — no listener yet
 
 ## Next steps
 
-Following the path left in `docs/DESIGN.md` §15 (**priority 0**: clear the three M1 debts above first, especially `ctxt_switches` — it surfaces silent wrong numbers the moment M0 hits real Linux):
+Following the path left in `docs/DESIGN.md` §15:
 
-1. **M0 VM base** — QEMU/KVM + virtio-vsock + savevm/loadvm + gdb stub; then the real `Transport` impl replaces `MockTransport`, blazesym's real kernel path (`vmlinux`/`kallsyms`) gets configured in one shot, and `introspect` runs end-to-end inside the guest.
-2. **M2 MCP front** — wrap `introspect` into an MCP tool + self-describing catalog (§13.8 side-effect level as a first-class field).
-3. **M5 hardening** — append-only file sink + real human gate + pre-emptive intervention hook (the fence is in place *before* M7 reaches in) — the full landing of axiom 13.
+1. **M0 physical acceptance** — run the harness on a qualifying Linux x86_64 KVM host, then capture the QMP snapshot, GDB, virtio-vsock, and guest-PT evidence.
+2. **M0 integration** — replace `MockTransport` with the real vsock transport and configure the blazesym `vmlinux`/`kallsyms` path inside the guest.
+3. **M2 MCP front** — wrap `introspect` into an MCP tool + self-describing catalog (§13.8 side-effect level as a first-class field).
+4. **M5 hardening** — append-only file sink + real human gate + pre-emptive intervention hook before any write capability.
 
 > **The iron rule** (§13.9 / axiom 13): build the cage first — including that pre-emptive fence — *before* the AI is allowed to reach in. Never let any write capability predate its container.
