@@ -584,16 +584,24 @@ mod tests {
         bytes
     }
 
-    fn lossy_cases() -> [(&'static str, &'static [&'static str]); 8] {
+    fn lossy_cases() -> [(
+        &'static str,
+        &'static [&'static str],
+        &'static [&'static str],
+    ); 8] {
         [
-            ("stat", STAT_LOSSY_PATHS),
-            ("status", STATUS_LOSSY_PATHS),
-            ("maps", MAPS_LOSSY_PATHS),
-            ("wchan", WCHAN_LOSSY_PATHS),
-            ("stack", STACK_LOSSY_PATHS),
-            ("cgroup", CGROUP_LOSSY_PATHS),
-            ("exe", EXE_LOSSY_PATHS),
-            ("cmdline", CMDLINE_LOSSY_PATHS),
+            ("stat", STAT_LOSSY_PATHS, &["identity.comm"]),
+            (
+                "status",
+                STATUS_LOSSY_PATHS,
+                &["identity.uid", "resource.ctxt_switches"],
+            ),
+            ("maps", MAPS_LOSSY_PATHS, &["mem_shape"]),
+            ("wchan", WCHAN_LOSSY_PATHS, &["state.wchan"]),
+            ("stack", STACK_LOSSY_PATHS, &["hotspot.frames"]),
+            ("cgroup", CGROUP_LOSSY_PATHS, &["identity.cgroup"]),
+            ("exe", EXE_LOSSY_PATHS, &["identity.exe"]),
+            ("cmdline", CMDLINE_LOSSY_PATHS, &["identity.cmdline"]),
         ]
     }
 
@@ -643,18 +651,31 @@ mod tests {
     fn invalid_utf8_is_replaced_and_mapped_to_every_affected_level0_path() {
         let invalid = invalid_utf8_capture();
 
-        for (what, expected_paths) in lossy_cases() {
-            let decoded = decode_proc_text(&invalid, what, expected_paths);
+        for (what, configured_paths, expected_paths) in lossy_cases() {
+            let decoded = decode_proc_text(&invalid, what, configured_paths);
 
             assert!(decoded.value.contains('\u{fffd}'), "{what}");
             assert_eq!(decoded.degradations.len(), expected_paths.len(), "{what}");
-            for (degradation, expected_path) in
-                decoded.degradations.iter().zip(expected_paths.iter())
-            {
-                assert_eq!(degradation.path, *expected_path, "{what}");
+            let actual_paths = decoded
+                .degradations
+                .iter()
+                .map(|degradation| degradation.path.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(actual_paths, expected_paths, "{what}");
+            for degradation in &decoded.degradations {
                 assert!(degradation.reason.contains(what), "{what}");
                 assert!(degradation.reason.contains("U+FFFD"), "{what}");
             }
+        }
+    }
+
+    #[test]
+    fn ordinary_utf8_is_preserved_and_emits_no_degradation() {
+        for (what, configured_paths, _) in lossy_cases() {
+            let decoded = decode_proc_text(CAPTURED_STAT, what, configured_paths);
+
+            assert_eq!(decoded.value.as_bytes(), CAPTURED_STAT, "{what}");
+            assert!(decoded.degradations.is_empty(), "{what}");
         }
     }
 
@@ -663,8 +684,8 @@ mod tests {
         let captured = std::str::from_utf8(CAPTURED_STAT).expect("captured stat is valid UTF-8");
         let valid = format!("{captured}\u{fffd}");
 
-        for (what, affected_paths) in lossy_cases() {
-            let decoded = decode_proc_text(valid.as_bytes(), what, affected_paths);
+        for (what, configured_paths, _) in lossy_cases() {
+            let decoded = decode_proc_text(valid.as_bytes(), what, configured_paths);
 
             assert!(decoded.value.ends_with('\u{fffd}'), "{what}");
             assert!(decoded.degradations.is_empty(), "{what}");
