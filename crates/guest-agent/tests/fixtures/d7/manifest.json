@@ -167,14 +167,29 @@
       }
     },
     {
+      "path": "maps/boundaries-beijing.txt",
+      "kind": "proc_maps",
+      "captured_at": "2026-07-29T15:49:42Z",
+      "kernel_release": "5.15.0-171-generic",
+      "architecture": "x86_64",
+      "command": "python3 mmap boundary capture; read /proc/self/maps",
+      "state": null,
+      "sha256": "6bf32f82b7ed40246df0ad96756943bf05435ff14826e8b0729ce3c6e2086317",
+      "provenance": {
+        "kind": "captured",
+        "source": null,
+        "mutation": null
+      }
+    },
+    {
       "path": "cgroup/beijing-v2.txt",
       "kind": "proc_cgroup",
-      "captured_at": "2026-07-29",
+      "captured_at": "2026-07-29T15:49:42Z",
       "kernel_release": "5.15.0-171-generic",
       "architecture": "x86_64",
       "command": "cat /proc/self/cgroup",
       "state": null,
-      "sha256": "8673bdd234eeb80f66a36e53e53c0f56b1db10e0d68cd7b062f0abefaf83728f",
+      "sha256": "821a98987dc9a9f5cf0eb60e0bb66ff9d34e2dc0a3f3003b9304f8b4fa8cdb05",
       "provenance": {
         "kind": "captured",
         "source": null,

@@ -339,6 +339,12 @@ fn parse_cgroup_line(line: &str) -> Result<CgroupEntry, ProcError> {
             reason: "path 为空".into(),
         });
     }
+    if !path.starts_with('/') {
+        return Err(ProcError::Parse {
+            what: "cgroup".into(),
+            reason: format!("path 不是绝对路径: {path:?}"),
+        });
+    }
     hierarchy.parse::<u32>().map_err(|error| ProcError::Parse {
         what: "cgroup".into(),
         reason: format!("hierarchy 非数字 {hierarchy:?}: {error}"),
@@ -458,7 +464,6 @@ pub fn parse_maps_with_diagnostics(content: &str) -> Result<ParsedMaps, ProcErro
     let mut skipped_line_count = 0usize;
 
     for line in content.lines() {
-        let line = line.trim_end();
         if line.is_empty() {
             continue;
         }
@@ -577,6 +582,15 @@ fn parse_map_line(line: &str) -> Result<MapLine, String> {
         .next()
         .ok_or("缺 perms 字段")?
         .to_string();
+    let perms_bytes = perms.as_bytes();
+    if perms_bytes.len() != 4
+        || !matches!(perms_bytes[0], b'r' | b'-')
+        || !matches!(perms_bytes[1], b'w' | b'-')
+        || !matches!(perms_bytes[2], b'x' | b'-')
+        || !matches!(perms_bytes[3], b'p' | b's')
+    {
+        return Err(format!("perms 不匹配 [r-][w-][x-][ps]: {perms:?}"));
+    }
     // 路径段在最末：从 rest 找第二+次空格分布中开头第 5 个 token 之后的整段。
     // 兜底更稳的方式: 找 path 起点为 perms 之后第 4 个空格分界的位置。
     // 在 M1 简化口径下: 用 token 计数, 多于 5 个 token 说明 path 存在.
@@ -599,7 +613,7 @@ fn parse_map_line(line: &str) -> Result<MapLine, String> {
         .map_err(|error| format!("inode 非十进制 {:?}: {error}", tokens[3]))?;
     let path = if tokens.len() > 4 {
         let path_start_byte_in_rest = whitespace_token_start(rest, 4).ok_or("path 起点定位失败")?;
-        Some(rest[path_start_byte_in_rest..].trim().to_string())
+        Some(rest[path_start_byte_in_rest..].to_string())
     } else {
         None
     };
