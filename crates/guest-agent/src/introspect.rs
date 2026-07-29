@@ -70,7 +70,7 @@ pub fn introspect(pid: i32) -> Result<Level0, ProcError> {
             Arc::new(ThreadSampleClock),
             DEFAULT_SAMPLE_INTERVAL,
         )
-        .introspect(pid);
+        .introspect(pid)
     }
 
     #[cfg(not(target_os = "linux"))]
