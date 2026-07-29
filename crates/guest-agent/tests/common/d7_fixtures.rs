@@ -124,15 +124,12 @@ mod tests {
         let indexed_paths: BTreeSet<_> = STATE_FIXTURES.iter().map(|(_, path)| *path).collect();
         let captured_stats: Vec<_> = records
             .values()
-            .filter(|record| {
-                record.kind == "proc_stat" && record.provenance.kind == "captured"
-            })
+            .filter(|record| record.kind == "proc_stat" && record.provenance.kind == "captured")
             .collect();
         let derived_stats: Vec<_> = records
             .values()
             .filter(|record| {
-                record.kind == "proc_stat"
-                    && record.provenance.kind == "derived_state_byte"
+                record.kind == "proc_stat" && record.provenance.kind == "derived_state_byte"
             })
             .collect();
 
