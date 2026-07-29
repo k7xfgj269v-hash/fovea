@@ -1,0 +1,48 @@
+5641a55aa000-5641a55ac000 r--p 00000000 fc:02 914                        /usr/bin/cat
+5641a55ac000-5641a55b0000 r-xp 00002000 fc:02 914                        /usr/bin/cat
+5641a55b0000-5641a55b2000 r--p 00006000 fc:02 914                        /usr/bin/cat
+5641a55b2000-5641a55b3000 r--p 00007000 fc:02 914                        /usr/bin/cat
+5641a55b3000-5641a55b4000 rw-p 00008000 fc:02 914                        /usr/bin/cat
+5641d0723000-5641d0744000 rw-p 00000000 00:00 0                          [heap]
+7efd00ccc000-7efd00cee000 rw-p 00000000 00:00 0 
+7efd00cee000-7efd00fd7000 r--p 00000000 fc:02 4061                       /usr/lib/locale/locale-archive
+7efd00fd7000-7efd00fff000 r--p 00000000 fc:02 3505                       /usr/lib/x86_64-linux-gnu/libc.so.6
+7efd00fff000-7efd01194000 r-xp 00028000 fc:02 3505                       /usr/lib/x86_64-linux-gnu/libc.so.6
+7efd01194000-7efd011ec000 r--p 001bd000 fc:02 3505                       /usr/lib/x86_64-linux-gnu/libc.so.6
+7efd011ec000-7efd011ed000 ---p 00215000 fc:02 3505                       /usr/lib/x86_64-linux-gnu/libc.so.6
+7efd011ed000-7efd011f1000 r--p 00215000 fc:02 3505                       /usr/lib/x86_64-linux-gnu/libc.so.6
+7efd011f1000-7efd011f3000 rw-p 00219000 fc:02 3505                       /usr/lib/x86_64-linux-gnu/libc.so.6
+7efd011f3000-7efd01200000 rw-p 00000000 00:00 0 
+7efd01200000-7efd01203000 r-xp 00000000 fc:02 14965                      /usr/lib/x86_64-linux-gnu/libonion_security.so.1.0.19
+7efd01203000-7efd01303000 ---p 00003000 fc:02 14965                      /usr/lib/x86_64-linux-gnu/libonion_security.so.1.0.19
+7efd01303000-7efd01304000 rw-p 00003000 fc:02 14965                      /usr/lib/x86_64-linux-gnu/libonion_security.so.1.0.19
+7efd01304000-7efd01306000 rw-p 00000000 00:00 0 
+7efd01314000-7efd0136b000 r--p 00000000 fc:02 718                        /usr/lib/locale/C.utf8/LC_CTYPE
+7efd0136b000-7efd0136c000 r--p 00000000 fc:02 745                        /usr/lib/locale/C.utf8/LC_NUMERIC
+7efd0136c000-7efd0136f000 rw-p 00000000 00:00 0 
+7efd0136f000-7efd01370000 r--p 00000000 fc:02 6998                       /usr/lib/x86_64-linux-gnu/libdl.so.2
+7efd01370000-7efd01371000 r-xp 00001000 fc:02 6998                       /usr/lib/x86_64-linux-gnu/libdl.so.2
+7efd01371000-7efd01372000 r--p 00002000 fc:02 6998                       /usr/lib/x86_64-linux-gnu/libdl.so.2
+7efd01372000-7efd01373000 r--p 00002000 fc:02 6998                       /usr/lib/x86_64-linux-gnu/libdl.so.2
+7efd01373000-7efd01374000 rw-p 00003000 fc:02 6998                       /usr/lib/x86_64-linux-gnu/libdl.so.2
+7efd01374000-7efd01375000 r--p 00000000 fc:02 787                        /usr/lib/locale/C.utf8/LC_TIME
+7efd01375000-7efd01376000 r--p 00000000 fc:02 715                        /usr/lib/locale/C.utf8/LC_COLLATE
+7efd01376000-7efd01377000 r--p 00000000 fc:02 733                        /usr/lib/locale/C.utf8/LC_MONETARY
+7efd01377000-7efd01378000 r--p 00000000 fc:02 727                        /usr/lib/locale/C.utf8/LC_MESSAGES/SYS_LC_MESSAGES
+7efd01378000-7efd01379000 r--p 00000000 fc:02 772                        /usr/lib/locale/C.utf8/LC_PAPER
+7efd01379000-7efd0137a000 r--p 00000000 fc:02 736                        /usr/lib/locale/C.utf8/LC_NAME
+7efd0137a000-7efd0137b000 r--p 00000000 fc:02 676                        /usr/lib/locale/C.utf8/LC_ADDRESS
+7efd0137b000-7efd0137c000 r--p 00000000 fc:02 776                        /usr/lib/locale/C.utf8/LC_TELEPHONE
+7efd0137c000-7efd0137d000 r--p 00000000 fc:02 723                        /usr/lib/locale/C.utf8/LC_MEASUREMENT
+7efd0137d000-7efd01384000 r--s 00000000 fc:02 143836                     /usr/lib/x86_64-linux-gnu/gconv/gconv-modules.cache
+7efd01384000-7efd01386000 rw-p 00000000 00:00 0 
+7efd01386000-7efd01388000 r--p 00000000 fc:02 2386                       /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7efd01388000-7efd013b2000 r-xp 00002000 fc:02 2386                       /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7efd013b2000-7efd013bd000 r--p 0002c000 fc:02 2386                       /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7efd013bd000-7efd013be000 r--p 00000000 fc:02 719                        /usr/lib/locale/C.utf8/LC_IDENTIFICATION
+7efd013be000-7efd013c0000 r--p 00037000 fc:02 2386                       /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7efd013c0000-7efd013c2000 rw-p 00039000 fc:02 2386                       /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7ffe38578000-7ffe38599000 rw-p 00000000 00:00 0                          [stack]
+7ffe385de000-7ffe385e2000 r--p 00000000 00:00 0                          [vvar]
+7ffe385e2000-7ffe385e4000 r-xp 00000000 00:00 0                          [vdso]
+ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]
