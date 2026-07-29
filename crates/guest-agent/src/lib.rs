@@ -15,9 +15,15 @@
 //! 通过 trait 接口由调用方（M2 MCP server shell）注入 Transport，不要把传输层塞进来。
 
 pub mod introspect;
+pub mod proc_source;
 pub mod proc_view;
 pub mod symbolize;
 
-pub use introspect::{introspect, introspect_with, introspect_with_inputs};
+pub use introspect::{introspect, introspect_with, introspect_with_inputs, IntrospectService};
+#[cfg(target_os = "linux")]
+pub use proc_source::LinuxProcSource;
+pub use proc_source::{
+    CpuCounters, ProcError, ProcSnapshot, ProcSource, SampleClock, ThreadSampleClock,
+};
 
 pub use introspect_schema as schema;

@@ -26,12 +26,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # 异步运行时（控制面用，数据面 introspect 本身保持同步可单测）
 tokio = { version = "1", features = ["full"] }
+# Linux virtio-vsock adapter
+tokio-vsock = "=0.7.2"
 # 异步 trait
 async-trait = "0.1"
 # 时间
 chrono = { version = "0.4", features = ["serde"] }
 # 唯一 id
 uuid = { version = "1", features = ["v4", "serde"] }
+# Linux adapter uses the public sysconf ABI for runtime page size.
+libc = "0.2"
 
 # workspace 内部依赖走 path
 vsock = { path = "crates/vsock" }

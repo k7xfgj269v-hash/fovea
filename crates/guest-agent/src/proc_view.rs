@@ -5,72 +5,12 @@
 //! 对目标进程连观察者效应都没有（§13.4）。
 //!
 //! 本模块专门负责解析层；不在本模块做符号化（符号化是 [`crate::symbolize`] 的事），
-//! 不在本模块组合出完整 [`Level0`]（那是 [`super::engine`] 的事）。单一职责让 /proc
-//! 读取逻辑可单测、不依赖 blazesym、不依赖 vsock——所以可以在 Mac 上跑测试。
+//! 不在本模块组合完整 Level 0（那是 [`crate::introspect`] 的事）。Linux 文件 I/O
+//! 全部留在 [`crate::proc_source`]，因此解析测试可以在 Mac 上运行。
 
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
+use introspect_schema::{MapKind, MapKindBucket, MemShape, RunState, TopMap};
 
-use introspect_schema::{MapKind, MemShape, MapKindBucket, RunState, TopMap};
-
-/// /proc 解析层失败模式。结构化（§2.2），不是 IOException 散文。
-///
-/// serde 约束：本 enum 是 `#[serde(tag = "kind")]` 内部标签枚举。
-/// 内部标签只接受 unit / struct / newtype-包-map 变体；newtype-包-i32
-/// 能编过但运行时 `serde_json::to_string` 会返 Err（"cannot serialize
-/// tagged newtype variant containing an integer"）。`ProcNotFound` 是
-/// introspect 最常见错误路径（pid 没了）——偏偏在最该报错时序列化失败
-/// 是最糟的失效模式，所以用 struct 变体保安全。
-#[derive(Debug, Error, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ProcError {
-    #[error("pid {pid} 不存在")]
-    ProcNotFound { pid: i32 },
-    #[error("读 /proc 权限不足")]
-    Permission,
-    #[error("解析 {what} 失败：{reason}")]
-    Parse { what: String, reason: String },
-    /// M1 第一刀之后、第二刀之前的占位状态——壳在位、实现待填。
-    /// 见 [`crate::engine::introspect`]
-    #[error("尚未实现（M1 第二刀）")]
-    NotImplemented,
-}
-
-/// ProcError → 跨 vsock 的 `ErrorReport` 三元组（§2.2 结构化错误）。
-///
-/// 返 (kind, reason, next_step)，让真正跨边界的调用方（M2 MCP server
-/// 或 transport 层）自己包成 vsock::model::ErrorReport——本 crate 不
-/// 依赖 vsock（schema/vsock 是叶子、guest-agent 不向下 dep vsock 避免
-/// 循环）。
-///
-/// kind 串走 snake_case，匹配 vsock::model::ErrorReport doc 的样例
-/// （proc_not_found / proc_parse_failed）。
-impl ProcError {
-    pub fn to_error_report(&self) -> (&'static str, String, Option<&'static str>) {
-        match self {
-            ProcError::ProcNotFound { pid } => (
-                "proc_not_found",
-                format!("pid {pid} 不存在或已退出"),
-                Some("重试前用 introspect(pid=1) 或类似探活；确认 pid 仍存活"),
-            ),
-            ProcError::Permission => (
-                "proc_permission_denied",
-                "读 /proc/<pid>/ 权限不足".into(),
-                Some("guest-agent 需挂足够权限（root 或 CAP_SYS_PTRACE 等）"),
-            ),
-            ProcError::Parse { what, reason } => (
-                "proc_parse_failed",
-                format!("解析 {what} 失败：{reason}"),
-                Some("大概率是 /proc 行格式漂移；对齐到目标内核版本"),
-            ),
-            ProcError::NotImplemented => (
-                "not_implemented",
-                "introspect 该路径尚未在当前 milestone 实现".into(),
-                None,
-            ),
-        }
-    }
-}
+pub use crate::proc_source::ProcError;
 
 // ─── /proc/<pid>/stat 的裸解析产物 ─────────────────────────────────────────────
 
@@ -88,6 +28,10 @@ pub struct Stat {
     pub nr_threads: u32,
     pub vsize: u64,
     pub rss: u64,
+    /// stat 字段 14 + 15：进程用户态和内核态累计 ticks。
+    pub process_ticks: u64,
+    /// stat 字段 22：进程启动时间，用于识别 PID 对应的进程代际。
+    pub process_start_time_ticks: u64,
     /// stat 第 39 字段：last CPU。
     pub last_cpu: u32,
     // ⚠️ ctxt_switches **不**从 stat 取。man proc 字段 40 = `rt_priority`、
@@ -101,7 +45,7 @@ pub struct Stat {
 /// VmSize 已在 stat 里有多份来源）不去重——本刀只取 identity.uid + fd 上限
 /// （§10 没有 fd 极限字段，但 knowledge 用途放在 §6 第 1 层 know-your-target）
 /// + ctxt_switches（stat 的 40/41 是 rt_priority/policy 不是 ctxt，**只能**从
-/// status 取——这条是 §§ 读侧静默污染防线的代码归宿之一）。
+///   status 取——这条是 §§ 读侧静默污染防线的代码归宿之一）。
 #[derive(Debug, Clone, Default)]
 pub struct Status {
     pub uid: u32,
@@ -142,20 +86,28 @@ pub(crate) const MEM_SHAPE_TOP_N: usize = 5;
 pub fn parse_stat(content: &str) -> Result<Stat, ProcError> {
     let content = content.trim();
     // 先找左括号（接在 pid 后面）。
-    let lparen = content
-        .find('(')
-        .ok_or_else(|| ProcError::Parse { what: "stat".into(), reason: "缺少左括号 (comm)".into() })?;
-    let rparen = content
-        .rfind(')')
-        .ok_or_else(|| ProcError::Parse { what: "stat".into(), reason: "缺少右括号 (comm)".into() })?;
+    let lparen = content.find('(').ok_or_else(|| ProcError::Parse {
+        what: "stat".into(),
+        reason: "缺少左括号 (comm)".into(),
+    })?;
+    let rparen = content.rfind(')').ok_or_else(|| ProcError::Parse {
+        what: "stat".into(),
+        reason: "缺少右括号 (comm)".into(),
+    })?;
     if rparen < lparen {
-        return Err(ProcError::Parse { what: "stat".into(), reason: "右括号在左括号之前".into() });
+        return Err(ProcError::Parse {
+            what: "stat".into(),
+            reason: "右括号在左括号之前".into(),
+        });
     }
     // pid 在左括号之前的第一个字段。
     let pid_str = content[..lparen].trim();
     let pid: i32 = pid_str
         .parse()
-        .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.pid".into(), reason: e.to_string() })?;
+        .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+            what: "stat.pid".into(),
+            reason: e.to_string(),
+        })?;
     // comm = 括号内（去括号）。 不再加回括号——§10 identity.comm 是不带括号的进程名。
     let comm = content[lparen + 1..rparen].to_string();
     // 右括号之后按空格分词。第一个 = state（单字符）。
@@ -172,23 +124,59 @@ pub fn parse_stat(content: &str) -> Result<Stat, ProcError> {
     let state = parse_run_state(need(0, "state")?)?;
     let ppid: i32 = need(1, "ppid")?
         .parse()
-        .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.ppid".into(), reason: e.to_string() })?;
-    // 字段 20=nr_threads => idx 17 (20-3)。
-    let nr_threads: u32 = need(17, "nr_threads")?
+        .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+            what: "stat.ppid".into(),
+            reason: e.to_string(),
+        })?;
+    let utime: u64 = need(11, "utime")?
         .parse()
-        .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.nr_threads".into(), reason: e.to_string() })?;
+        .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+            what: "stat.utime".into(),
+            reason: e.to_string(),
+        })?;
+    let stime: u64 = need(12, "stime")?
+        .parse()
+        .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+            what: "stat.stime".into(),
+            reason: e.to_string(),
+        })?;
+    // 字段 20=nr_threads => idx 17 (20-3)。
+    let nr_threads: u32 =
+        need(17, "nr_threads")?
+            .parse()
+            .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+                what: "stat.nr_threads".into(),
+                reason: e.to_string(),
+            })?;
+    // 字段 22=starttime => idx 19。
+    let process_start_time_ticks: u64 =
+        need(19, "starttime")?
+            .parse()
+            .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+                what: "stat.starttime".into(),
+                reason: e.to_string(),
+            })?;
     // 字段 23=vsize => idx 20。
     let vsize: u64 = need(20, "vsize")?
         .parse()
-        .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.vsize".into(), reason: e.to_string() })?;
+        .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+            what: "stat.vsize".into(),
+            reason: e.to_string(),
+        })?;
     // 字段 24=rss => idx 21。rss 在 stat 里是**页数**，不是字节——要之后乘 page size。
     let rss_pages: u64 = need(21, "rss")?
         .parse()
-        .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.rss".into(), reason: e.to_string() })?;
+        .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+            what: "stat.rss".into(),
+            reason: e.to_string(),
+        })?;
     // 字段 39=last_cpu => idx 36。
     let last_cpu: u32 = need(36, "last_cpu")?
         .parse()
-        .map_err(|e: std::num::ParseIntError| ProcError::Parse { what: "stat.last_cpu".into(), reason: e.to_string() })?;
+        .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+            what: "stat.last_cpu".into(),
+            reason: e.to_string(),
+        })?;
     // ⚠️ 不读字段 40/41——那是 rt_priority/policy（不是 ctxt）。ctxt 从
     // status 取（见 parse_status）。历史代码 need(37)/need(38) 把 rt_priority/
     // policy 当成 ctxt 是静默错数 bug，同构 fixture 让它在 Mac 单测里测不出。
@@ -201,8 +189,105 @@ pub fn parse_stat(content: &str) -> Result<Stat, ProcError> {
         nr_threads,
         vsize,
         rss: rss_pages,
+        process_ticks: utime.saturating_add(stime),
+        process_start_time_ticks,
         last_cpu,
     })
+}
+
+/// Parsed aggregate `/proc/stat` CPU counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemCpu {
+    pub ticks: u64,
+    pub logical_cpus: u32,
+}
+
+/// Parse aggregate CPU ticks and the logical CPU line count from `/proc/stat`.
+///
+/// Linux reports guest and guest_nice as time already included in user and
+/// nice, so only the first eight counters are summed to avoid double-counting.
+pub fn parse_system_cpu(content: &str) -> Result<SystemCpu, ProcError> {
+    let mut aggregate = None;
+    let mut logical_cpus: u32 = 0;
+
+    for line in content.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(name) = fields.next() else {
+            continue;
+        };
+        if name == "cpu" {
+            let values: Vec<&str> = fields.collect();
+            if values.len() < 4 {
+                return Err(ProcError::Parse {
+                    what: "proc_stat.cpu".into(),
+                    reason: "aggregate cpu 行少于 4 个计数器".into(),
+                });
+            }
+            let mut ticks = 0u64;
+            for value in values.into_iter().take(8) {
+                let value = value
+                    .parse::<u64>()
+                    .map_err(|error: std::num::ParseIntError| ProcError::Parse {
+                        what: "proc_stat.cpu".into(),
+                        reason: error.to_string(),
+                    })?;
+                ticks = ticks.checked_add(value).ok_or_else(|| ProcError::Parse {
+                    what: "proc_stat.cpu".into(),
+                    reason: "aggregate cpu ticks 溢出 u64".into(),
+                })?;
+            }
+            aggregate = Some(ticks);
+        } else if let Some(index) = name.strip_prefix("cpu") {
+            if !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()) {
+                logical_cpus = logical_cpus
+                    .checked_add(1)
+                    .ok_or_else(|| ProcError::Parse {
+                        what: "proc_stat.logical_cpus".into(),
+                        reason: "logical CPU 数溢出 u32".into(),
+                    })?;
+            }
+        }
+    }
+
+    let ticks = aggregate.ok_or_else(|| ProcError::Parse {
+        what: "proc_stat.cpu".into(),
+        reason: "缺 aggregate cpu 行".into(),
+    })?;
+    if logical_cpus == 0 {
+        return Err(ProcError::Parse {
+            what: "proc_stat.logical_cpus".into(),
+            reason: "没有 cpuN 行".into(),
+        });
+    }
+
+    Ok(SystemCpu {
+        ticks,
+        logical_cpus,
+    })
+}
+
+/// Parse the first cgroup path from `/proc/<pid>/cgroup`.
+pub fn parse_cgroup(content: &str) -> Result<Option<String>, ProcError> {
+    let Some(line) = content.lines().find(|line| !line.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let mut fields = line.splitn(3, ':');
+    let _hierarchy = fields.next();
+    let _controllers = fields.next().ok_or_else(|| ProcError::Parse {
+        what: "cgroup".into(),
+        reason: "缺 controllers 字段".into(),
+    })?;
+    let path = fields.next().ok_or_else(|| ProcError::Parse {
+        what: "cgroup".into(),
+        reason: "缺 path 字段".into(),
+    })?;
+    if path.is_empty() {
+        return Err(ProcError::Parse {
+            what: "cgroup".into(),
+            reason: "path 为空".into(),
+        });
+    }
+    Ok(Some(path.to_string()))
 }
 
 fn parse_run_state(s: &str) -> Result<RunState, ProcError> {
@@ -235,30 +320,41 @@ pub fn parse_status(content: &str) -> Result<Status, ProcError> {
         if let Some(rest) = line.strip_prefix("Uid:") {
             // `Uid:\t1000\t1000\t1000\t1000` — 四列 (real/effective/saved/fs)。
             // 取第一列 real uid。
-            let first = rest.trim_start().split_whitespace().next().unwrap_or("0");
-            st.uid = first.parse().map_err(|e: std::num::ParseIntError| ProcError::Parse {
-                what: "status.uid".into(),
-                reason: e.to_string(),
-            })?;
+            let first = rest.split_whitespace().next().unwrap_or("0");
+            st.uid = first
+                .parse()
+                .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+                    what: "status.uid".into(),
+                    reason: e.to_string(),
+                })?;
         } else if let Some(rest) = line.strip_prefix("FDSize:") {
-            let n = rest.trim().parse::<u32>().map_err(|e: std::num::ParseIntError| ProcError::Parse {
-                what: "status.fdsize".into(),
-                reason: e.to_string(),
-            })?;
+            let n = rest
+                .trim()
+                .parse::<u32>()
+                .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+                    what: "status.fdsize".into(),
+                    reason: e.to_string(),
+                })?;
             st.fd_size = Some(n);
         } else if let Some(rest) = line.strip_prefix("voluntary_ctxt_switches:") {
             // 单值行 `voluntary_ctxt_switches:\t<N>`。缺行（stripped 内核偶见）
             // 走 Default=0——best-effort（§11）。**唯一**可靠源：stat 的 40/41
             // 字段是 rt_priority/policy，不能当 ctxt 用。
-            st.voluntary_ctxt_switches = rest.trim().parse::<u64>().map_err(|e: std::num::ParseIntError| ProcError::Parse {
-                what: "status.voluntary_ctxt_switches".into(),
-                reason: e.to_string(),
-            })?;
+            st.voluntary_ctxt_switches =
+                rest.trim()
+                    .parse::<u64>()
+                    .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+                        what: "status.voluntary_ctxt_switches".into(),
+                        reason: e.to_string(),
+                    })?;
         } else if let Some(rest) = line.strip_prefix("nonvoluntary_ctxt_switches:") {
-            st.nonvoluntary_ctxt_switches = rest.trim().parse::<u64>().map_err(|e: std::num::ParseIntError| ProcError::Parse {
-                what: "status.nonvoluntary_ctxt_switches".into(),
-                reason: e.to_string(),
-            })?;
+            st.nonvoluntary_ctxt_switches =
+                rest.trim()
+                    .parse::<u64>()
+                    .map_err(|e: std::num::ParseIntError| ProcError::Parse {
+                        what: "status.nonvoluntary_ctxt_switches".into(),
+                        reason: e.to_string(),
+                    })?;
         }
     }
     Ok(st)
@@ -287,10 +383,11 @@ pub fn parse_maps(content: &str) -> Result<MemShape, ProcError> {
         if line.is_empty() {
             continue;
         }
-        let map = parse_map_line(line)
-            .map_err(|e| ProcError::Parse { what: "maps".into(), reason: e })?;
-        let kind = classify_map_kind(&map.perms, map.path.as_deref())
-            .unwrap_or(MapKind::Anon); // 无 path → Anon；§10 五类里没列的归 Anon 兜底
+        let map = parse_map_line(line).map_err(|e| ProcError::Parse {
+            what: "maps".into(),
+            reason: e,
+        })?;
+        let kind = classify_map_kind(&map.perms, map.path.as_deref()).unwrap_or(MapKind::Anon); // 无 path → Anon；§10 五类里没列的归 Anon 兜底
         let size = map.end.saturating_sub(map.start);
         // 直方图累加
         let entry = buckets.entry(kind).or_insert((0, 0));
@@ -325,10 +422,13 @@ pub fn parse_maps(content: &str) -> Result<MemShape, ProcError> {
     histogram.sort_by_key(|b| b.kind as i32);
 
     // top-N：按 size 降序取前 MEM_SHAPE_TOP_N
-    tops.sort_by(|a, b| b.size.cmp(&a.size));
+    tops.sort_by_key(|map| std::cmp::Reverse(map.size));
     tops.truncate(MEM_SHAPE_TOP_N);
 
-    Ok(MemShape { histogram, top_n: tops })
+    Ok(MemShape {
+        histogram,
+        top_n: tops,
+    })
 }
 
 /// /proc/<pid>/maps 单行解析中间件。
@@ -367,9 +467,7 @@ fn parse_map_line(line: &str) -> Result<MapLine, String> {
     let tokens: Vec<&str> = rest.split_whitespace().collect();
     // tokens[0]=perms, tokens[1]=offset, tokens[2]=dev, tokens[3]=inode, tokens[4..]=path
     let path = if tokens.len() > 4 {
-        let path_start_byte_in_rest = rest
-            .find(tokens[4])
-            .ok_or("path 起点定位失败")?;
+        let path_start_byte_in_rest = rest.find(tokens[4]).ok_or("path 起点定位失败")?;
         Some(rest[path_start_byte_in_rest..].trim().to_string())
     } else {
         None
@@ -424,10 +522,8 @@ pub fn classify_map_kind(perms: &str, path: Option<&str>) -> Option<MapKind> {
 
 // ─── §13.4 scan_fds / read_wchan / read_kernel_stack ────────────────────────
 //
-// 这三个不走 fixture 字符串——它们内里要么读 dir 要么读文件。
-// 但因为本刀要在 Mac 上单测，引擎层（engine::introspect）也只在 Linux
-// 真跑，我们把这层 API 拆成「输入是原始字节、对字节做解析/计数」的纯函数，
-// 和「把 /proc 路径读出来再交给纯函数」的 I/O 层分开：
+// 这层 API 只接收 adapter 已读取的内容：目录项名、wchan 文本和 stack 文本。
+// LinuxProcSource 负责路径与 I/O，本模块只做可跨平台测试的解析/计数：
 //
 //   - `scan_fds_from_names(&[String]) -> u32` —— 纯函数，输入 /proc/<pid>/fd
 //     的目录项名（"0","1","2","3", ...），按规则去 "." ".." 后计数，返 fd 数。
@@ -437,8 +533,7 @@ pub fn classify_map_kind(perms: &str, path: Option<&str>) -> Option<MapKind> {
 //     按行格式 `[<hex_addr>] func_name+0xoffset/0xsize`，解析出 (addr, sym) 帧
 //     列表；纯函数。
 //
-// 真正做文件 / 目录 I/O 的薄壳函数（`read_stat_file`、`scan_fds_dir` 等）
-// 留到 M0 进靶机后一次性 cfg-gate 落到 Linux——本刀不落任何 fs::read。
+// 真正的文件 / 目录 I/O 只在 `proc_source::LinuxProcSource`。
 
 /// /proc/<pid>/fd 的目录项名列表 → fd 数。
 ///
@@ -502,7 +597,10 @@ pub fn read_kernel_stack_from_str(content: &str) -> Vec<(String, String)> {
         };
         // addr 段在 [...] 内, 可含 < >
         let addr_seg = &line[open + 1..close];
-        let addr = addr_seg.trim_start_matches('<').trim_end_matches('>').to_string();
+        let addr = addr_seg
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .to_string();
         // 符号段是 close 之后第一个非空白 token (直到行尾, 含 +0x... 偏移)
         let sym = line[close + 1..].trim();
         if sym.is_empty() {
@@ -512,9 +610,6 @@ pub fn read_kernel_stack_from_str(content: &str) -> Vec<(String, String)> {
     }
     out
 }
-
-// TODO(M0 进靶机后)：落的薄壳函数 fs::read_to_string(..) 桥接 /proc 真路径
-// 到上面的纯函数。Mac 上不写——纯函数够 fixture 单测。
 
 #[cfg(test)]
 mod tests {
@@ -531,6 +626,10 @@ mod tests {
         let cases: Vec<ProcError> = vec![
             ProcError::ProcNotFound { pid: 42 },
             ProcError::Permission,
+            ProcError::Read {
+                what: "/proc/stat".into(),
+                reason: "unavailable".into(),
+            },
             ProcError::Parse {
                 what: "stat".into(),
                 reason: "bad number".into(),
@@ -541,9 +640,13 @@ mod tests {
             let s = serde_json::to_string(&c)
                 .unwrap_or_else(|e| panic!("variant #{i} 序列化失败：{e}: {c:?}"));
             // 反序列化回来要等价（按 tag 区分）
-            let back: ProcError =
-                serde_json::from_str(&s).unwrap_or_else(|e| panic!("variant #{i} 反序列化失败：{e}"));
-            assert_eq!(s, serde_json::to_string(&back).unwrap(), "round-trip 不自洽");
+            let back: ProcError = serde_json::from_str(&s)
+                .unwrap_or_else(|e| panic!("variant #{i} 反序列化失败：{e}"));
+            assert_eq!(
+                s,
+                serde_json::to_string(&back).unwrap(),
+                "round-trip 不自洽"
+            );
         }
     }
 
@@ -578,13 +681,23 @@ mod tests {
     /// 其它字段填 0 占位。idx = field# - 3（因为 1=pid 2=comm 不入 tail）。
     //       tail idx: 0=state 1=ppid ... 17=nr_threads 20=vsize 21=rss ...
     //                 36=last_cpu
-    fn stat_line(pid: i32, comm: &str, state: &str, nr_threads: u32,
-                 vsize: u64, rss: u64, last_cpu: u32) -> String {
+    #[allow(clippy::too_many_arguments)]
+    fn stat_line(
+        pid: i32,
+        comm: &str,
+        state: &str,
+        nr_threads: u32,
+        process_start_time_ticks: u64,
+        vsize: u64,
+        rss: u64,
+        last_cpu: u32,
+    ) -> String {
         // tail 一共 idx 0..38 = 39 个字段。tail[37]/tail[38] 留 0（= rt_priority/
         // policy 的槽），不再塞假装的 ctxt 值。
         let mut tail: Vec<String> = (0..39).map(|_| "0".to_string()).collect();
-        tail[0]  = state.to_string();
+        tail[0] = state.to_string();
         tail[17] = nr_threads.to_string();
+        tail[19] = process_start_time_ticks.to_string();
         tail[20] = vsize.to_string();
         tail[21] = rss.to_string();
         tail[36] = last_cpu.to_string();
@@ -594,7 +707,7 @@ mod tests {
     /// §10 comm 含空格 + 内嵌括号——必须 rfind(')') 切回。
     #[test]
     fn parse_stat_comm_with_space() {
-        let s = stat_line(1, "systemd (init)", "S", 1, 12_345_678, 0, 5);
+        let s = stat_line(1, "systemd (init)", "S", 1, 123_456, 12_345_678, 0, 5);
         let r = parse_stat(&s).expect("comm 含空格/内嵌括号必须可解析");
         assert_eq!(r.pid, 1);
         assert_eq!(r.comm, "systemd (init)"); // 去外层括号、保留内层
@@ -607,7 +720,7 @@ mod tests {
     /// parse_status_extracts_uid_fdsize_and_ctxt。
     #[test]
     fn parse_stat_d_state() {
-        let s = stat_line(42, "demo", "D", 7, 4_000_000, 100_000, 9);
+        let s = stat_line(42, "demo", "D", 7, 987_654, 4_000_000, 100_000, 9);
         let r = parse_stat(&s).expect("最小 D 态样本可解析");
         assert_eq!(r.pid, 42);
         assert_eq!(r.comm, "demo");
@@ -615,7 +728,34 @@ mod tests {
         assert_eq!(r.nr_threads, 7);
         assert_eq!(r.vsize, 4_000_000);
         assert_eq!(r.rss, 100_000);
+        assert_eq!(r.process_ticks, 0);
+        assert_eq!(r.process_start_time_ticks, 987_654);
         assert_eq!(r.last_cpu, 9);
+    }
+
+    #[test]
+    fn parse_stat_process_ticks_are_utime_plus_stime() {
+        let mut tail = vec!["0".to_string(); 39];
+        tail[0] = "S".into();
+        tail[11] = "123".into();
+        tail[12] = "77".into();
+        tail[17] = "1".into();
+        tail[20] = "4096".into();
+        tail[21] = "1".into();
+        tail[36] = "0".into();
+        let stat = format!("42 (cpu-demo) {}\n", tail.join(" "));
+
+        assert_eq!(parse_stat(&stat).unwrap().process_ticks, 200);
+    }
+
+    #[test]
+    fn parse_stat_reads_process_start_time_ticks() {
+        let stat = stat_line(42, "generation", "S", 1, 7_654_321, 4096, 1, 0);
+
+        assert_eq!(
+            parse_stat(&stat).unwrap().process_start_time_ticks,
+            7_654_321
+        );
     }
 
     #[test]
@@ -624,18 +764,90 @@ mod tests {
         assert!(matches!(parse_stat(s), Err(ProcError::Parse { .. })));
     }
 
+    #[test]
+    fn parse_system_cpu_excludes_guest_ticks_and_counts_logical_cpus() {
+        let content = "cpu  10 20 30 40 50 60 70 80 900 1000\n\
+                       cpu0 1 2 3 4 5 6 7 8 9 10\n\
+                       cpu1 1 2 3 4 5 6 7 8 9 10\n\
+                       intr 123\n";
+        let parsed = parse_system_cpu(content).unwrap();
+
+        assert_eq!(parsed.ticks, 10 + 20 + 30 + 40 + 50 + 60 + 70 + 80);
+        assert_eq!(parsed.logical_cpus, 2);
+    }
+
+    #[test]
+    fn parse_system_cpu_rejects_missing_aggregate_or_logical_cpu_lines() {
+        assert!(matches!(
+            parse_system_cpu("cpu0 1 2 3 4\n"),
+            Err(ProcError::Parse { what, .. }) if what == "proc_stat.cpu"
+        ));
+        assert!(matches!(
+            parse_system_cpu("cpu 1 2 3 4\n"),
+            Err(ProcError::Parse { what, .. }) if what == "proc_stat.logical_cpus"
+        ));
+    }
+
+    #[test]
+    fn parse_cgroup_handles_v2_v1_absence_and_malformed_lines() {
+        assert_eq!(
+            parse_cgroup("0::/user.slice/demo.scope\n").unwrap(),
+            Some("/user.slice/demo.scope".into())
+        );
+        assert_eq!(
+            parse_cgroup("11:memory:/legacy/demo\n10:cpu:/legacy/demo\n").unwrap(),
+            Some("/legacy/demo".into())
+        );
+        assert_eq!(parse_cgroup("\n").unwrap(), None);
+        assert!(matches!(
+            parse_cgroup("malformed\n"),
+            Err(ProcError::Parse { what, .. }) if what == "cgroup"
+        ));
+    }
+
     // ─── parse_status ──────────────────────────────────────────────────────
 
     #[test]
-    fn parse_status_extracts_uid_and_fdsize() {
+    fn parse_status_extracts_uid_fdsize_and_ctxt() {
         let s = "Name:\tdemo\n\
                  Uid:\t1000\t1000\t1000\t1000\n\
                  Gid:\t1000\t1000\t1000\t1000\n\
                  FDSize:\t256\n\
+                 voluntary_ctxt_switches:\t123\n\
+                 nonvoluntary_ctxt_switches:\t45\n\
                  VmRSS:\t    1234 kB\n";
         let r = parse_status(s).unwrap();
         assert_eq!(r.uid, 1000);
         assert_eq!(r.fd_size, Some(256));
+        assert_eq!(r.voluntary_ctxt_switches, 123);
+        assert_eq!(r.nonvoluntary_ctxt_switches, 45);
+    }
+
+    #[test]
+    fn parse_status_rejects_malformed_ctxt_switch_counts_structurally() {
+        for (key, expected_what) in [
+            ("voluntary_ctxt_switches", "status.voluntary_ctxt_switches"),
+            (
+                "nonvoluntary_ctxt_switches",
+                "status.nonvoluntary_ctxt_switches",
+            ),
+        ] {
+            let status = format!("Uid:\t1000\t1000\t1000\t1000\n{key}:\tnot-a-number\n");
+            let error = parse_status(&status).expect_err("malformed count must fail");
+
+            match &error {
+                ProcError::Parse { what, reason } => {
+                    assert_eq!(what, expected_what);
+                    assert!(!reason.is_empty());
+                }
+                other => panic!("expected structured parse error, got {other:?}"),
+            }
+
+            let (kind, reason, next_step) = error.to_error_report();
+            assert_eq!(kind, "proc_parse_failed");
+            assert!(reason.contains(expected_what));
+            assert!(next_step.is_some());
+        }
     }
 
     // ─── parse_maps（皇冠明珠投影本体回归保护） ──────────────────────────────
@@ -666,8 +878,16 @@ mod tests {
         let output_lines = r.histogram.len() + r.top_n.len();
         // 投影成立：输入 12 行映射 → 出参顶多 5 + 5 = 10 行（实战 GB maps 上千行
         // → 投影，这里数据小但 ratio 必须 ≥ 投影方向）
-        assert!(r.histogram.len() <= 5, "histogram 超过 §10 五类: {:?}", r.histogram);
-        assert!(r.top_n.len() <= MEM_SHAPE_TOP_N, "top_n 超过 N: {}", r.top_n.len());
+        assert!(
+            r.histogram.len() <= 5,
+            "histogram 超过 §10 五类: {:?}",
+            r.histogram
+        );
+        assert!(
+            r.top_n.len() <= MEM_SHAPE_TOP_N,
+            "top_n 超过 N: {}",
+            r.top_n.len()
+        );
         // 5 类里至少应出现 Heap/Stack/XLib/File —— Anon 也一定在（[vdso]/[anon...]/[stack:tid]/纯匿名）
         let kinds: Vec<_> = r.histogram.iter().map(|b| b.kind).collect();
         assert!(kinds.contains(&MapKind::Heap));
@@ -676,7 +896,11 @@ mod tests {
         assert!(kinds.contains(&MapKind::File));
         assert!(kinds.contains(&MapKind::XLib));
         // heap 桶恰好 1 个映射，size = 0x100000
-        let heap = r.histogram.iter().find(|b| b.kind == MapKind::Heap).unwrap();
+        let heap = r
+            .histogram
+            .iter()
+            .find(|b| b.kind == MapKind::Heap)
+            .unwrap();
         assert_eq!(heap.count, 1);
         assert_eq!(heap.total_size, 0x100000);
         // top-N 是按 size 降序——最大的应排第一个
@@ -746,7 +970,15 @@ mod tests {
     #[test]
     fn scan_fds_from_names_counts_real_fds() {
         // /proc/<pid>/fd 目录通常会有 "." ".." 和 fd 编号
-        let names: Vec<String> = vec![".".into(), "..".into(), "0".into(), "1".into(), "2".into(), "3".into(), "17".into()];
+        let names: Vec<String> = vec![
+            ".".into(),
+            "..".into(),
+            "0".into(),
+            "1".into(),
+            "2".into(),
+            "3".into(),
+            "17".into(),
+        ];
         assert_eq!(scan_fds_from_names(&names), 5);
         // 空目录
         assert_eq!(scan_fds_from_names(&[".".into(), "..".into()]), 0);

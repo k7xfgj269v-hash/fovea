@@ -1,49 +1,166 @@
-//! 宿主侧审计 sink（§13.6）。
-//!
-//! §13.6 三条硬要求：
-//!   1. append-only — AI 改不了已 ship 的；
-//!   2. JSON lines —— 可 grep 可投影 (token 友好)；
-//!   3. 两流分开 —— 意图流 (每条决策完整) + 效果流 (采样运行时统计)。
-//!
-//! 本模块只定 **意图流** sink 的 trait + 内存实现。效果流 M6 探针在位后单独建模，
-//! 这里不混进来 (§13.6 明写)。
+//! Host-owned append-only intent and outcome audit streams.
+
+use std::sync::Mutex;
 
 use async_trait::async_trait;
-use std::sync::Mutex;
-use vsock::model::AuditEvent;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+use vsock::{
+    model::{Request, RequestBody, SideEffect},
+    TransportError,
+};
 
-/// append-only 意图审计 sink 行为。
+use crate::gate::GateDecision;
+
+/// Result of the host budget evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BudgetDecision {
+    Allow,
+    Deny { reason: String },
+}
+
+/// Whether the host authorizes transport dispatch after budget and gate checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchDecision {
+    Dispatch,
+    DoNotDispatch,
+}
+
+impl DispatchDecision {
+    fn from_decisions(budget: &BudgetDecision, gate: &GateDecision) -> Self {
+        if matches!(budget, BudgetDecision::Allow) && matches!(gate, GateDecision::Allow) {
+            Self::Dispatch
+        } else {
+            Self::DoNotDispatch
+        }
+    }
+}
+
+/// Host intent before the sink allocates its sequence and timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewIntentRecord {
+    pub request_id: Uuid,
+    pub request: RequestBody,
+    pub side_effect: SideEffect,
+    pub budget: BudgetDecision,
+    pub gate: GateDecision,
+    pub dispatch: DispatchDecision,
+}
+
+impl NewIntentRecord {
+    /// Build an intent from the request body and host decisions.
+    pub fn from_request(request: &Request, budget: BudgetDecision, gate: GateDecision) -> Self {
+        let dispatch = DispatchDecision::from_decisions(&budget, &gate);
+
+        Self {
+            request_id: request.id,
+            request: request.body.clone(),
+            side_effect: request.body.side_effect(),
+            budget,
+            gate,
+            dispatch,
+        }
+    }
+}
+
+/// Sequenced host authority record.
 ///
-/// M5 之前这些都是 trait 在位、实现纳真（M5 起）。 trait 的形状现在就钉死 =
-/// 让 §13.9 那 M5 一刀到代码里时不需要重改 vsock 的 schema。
+/// Guest evidence cannot construct this record as a protocol message:
+///
+/// ```compile_fail
+/// use host_supervisor::audit::IntentAuditRecord;
+/// use vsock::model::GuestToHost;
+///
+/// fn forge(record: IntentAuditRecord) -> GuestToHost {
+///     GuestToHost::IntentAuditRecord(record)
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentAuditRecord {
+    pub seq: u64,
+    pub ts: DateTime<Utc>,
+    pub request_id: Uuid,
+    pub request: RequestBody,
+    pub side_effect: SideEffect,
+    pub budget: BudgetDecision,
+    pub gate: GateDecision,
+    pub dispatch: DispatchDecision,
+}
+
+/// A host-observed failure after an intent was appended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostOutcome {
+    TransportFailure {
+        error: TransportError,
+    },
+    ProtocolCorrelationFailure {
+        expected_request_id: Uuid,
+        received_request_id: Uuid,
+    },
+}
+
+/// Host outcome stream entry supplied by the dispatcher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostOutcomeRecord {
+    pub request_id: Uuid,
+    pub ts: DateTime<Utc>,
+    pub outcome: HostOutcome,
+}
+
+/// Append-only host audit port.
 #[async_trait]
 pub trait AuditSink: Send + Sync {
-    /// append 一条意图事件。 返回该 sink 内部分配的稳定序号 (供回溯审计用)。
-    /// 实现要保证**写后不可改**(append-only)； §13.6 这是公理 7 的落地。
-    async fn append(&self, event: AuditEvent) -> Result<u64, AuditSinkError>;
+    async fn append_intent(
+        &self,
+        record: NewIntentRecord,
+    ) -> Result<IntentAuditRecord, AuditSinkError>;
+
+    async fn append_outcome(&self, record: HostOutcomeRecord) -> Result<u64, AuditSinkError>;
 }
 
-/// sink 失败模式。
+/// Audit sink failure.
 #[derive(Debug, thiserror::Error)]
 pub enum AuditSinkError {
-    #[error("append-only sink 写入失败：{0}")]
+    #[error("append-only sink write failed: {0}")]
     Write(String),
+    #[error("{stream} audit stream lock is poisoned")]
+    Poisoned { stream: &'static str },
+    #[error("{stream} audit sequence is exhausted")]
+    SequenceExhausted { stream: &'static str },
 }
 
-/// 单测用内存实现。生产侧换文件/数据库 (M5)。
+/// In-memory append-only sink with independent intent and outcome streams.
 pub struct InMemoryAuditSink {
-    events: Mutex<Vec<AuditEvent>>,
+    intents: Mutex<Vec<IntentAuditRecord>>,
+    outcomes: Mutex<Vec<(u64, HostOutcomeRecord)>>,
 }
 
 impl InMemoryAuditSink {
     pub fn new() -> Self {
         Self {
-            events: Mutex::new(Vec::new()),
+            intents: Mutex::new(Vec::new()),
+            outcomes: Mutex::new(Vec::new()),
         }
     }
-    /// 取写入的全部事件快照 (单测就緒性断言用)。
-    pub fn snapshot(&self) -> Vec<AuditEvent> {
-        self.events.lock().unwrap().clone()
+
+    /// Return a copy of the authoritative intent stream.
+    pub fn intent_snapshot(&self) -> Result<Vec<IntentAuditRecord>, AuditSinkError> {
+        self.intents
+            .lock()
+            .map(|records| records.clone())
+            .map_err(|_| AuditSinkError::Poisoned { stream: "intent" })
+    }
+
+    /// Return a copy of the separately sequenced host outcome stream.
+    pub fn outcome_snapshot(&self) -> Result<Vec<(u64, HostOutcomeRecord)>, AuditSinkError> {
+        self.outcomes
+            .lock()
+            .map(|records| records.clone())
+            .map_err(|_| AuditSinkError::Poisoned { stream: "outcome" })
     }
 }
 
@@ -55,40 +172,200 @@ impl Default for InMemoryAuditSink {
 
 #[async_trait]
 impl AuditSink for InMemoryAuditSink {
-    async fn append(&self, event: AuditEvent) -> Result<u64, AuditSinkError> {
-        let mut v = self.events.lock().unwrap();
-        let seq = event.seq;
-        v.push(event);
+    async fn append_intent(
+        &self,
+        record: NewIntentRecord,
+    ) -> Result<IntentAuditRecord, AuditSinkError> {
+        let mut records = self
+            .intents
+            .lock()
+            .map_err(|_| AuditSinkError::Poisoned { stream: "intent" })?;
+        let seq = next_sequence(records.len(), "intent")?;
+        let NewIntentRecord {
+            request_id,
+            request,
+            side_effect,
+            budget,
+            gate,
+            dispatch,
+        } = record;
+        let record = IntentAuditRecord {
+            seq,
+            ts: Utc::now(),
+            request_id,
+            request,
+            side_effect,
+            budget,
+            gate,
+            dispatch,
+        };
+        records.push(record.clone());
+        Ok(record)
+    }
+
+    async fn append_outcome(&self, record: HostOutcomeRecord) -> Result<u64, AuditSinkError> {
+        let mut records = self
+            .outcomes
+            .lock()
+            .map_err(|_| AuditSinkError::Poisoned { stream: "outcome" })?;
+        let seq = next_sequence(records.len(), "outcome")?;
+        records.push((seq, record));
         Ok(seq)
     }
+}
+
+fn next_sequence(len: usize, stream: &'static str) -> Result<u64, AuditSinkError> {
+    u64::try_from(len)
+        .ok()
+        .and_then(|seq| seq.checked_add(1))
+        .ok_or(AuditSinkError::SequenceExhausted { stream })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
-    use vsock::model::{IntentRecord, Owner};
+    use chrono::TimeZone;
+    use serde_json::json;
+    use vsock::model::GuestToHost;
 
-    fn make_event(seq: u64) -> AuditEvent {
-        AuditEvent {
-            seq,
-            ts: Utc::now(),
-            intent: IntentRecord::ReadProc {
-                pid: 1,
-                owner: Owner::Ai,
+    fn request(request_id: Uuid, pid: i32) -> Request {
+        Request {
+            id: request_id,
+            body: RequestBody::Introspect { pid },
+        }
+    }
+
+    fn allowed_intent(request_id: Uuid, pid: i32) -> NewIntentRecord {
+        NewIntentRecord::from_request(
+            &request(request_id, pid),
+            BudgetDecision::Allow,
+            GateDecision::Allow,
+        )
+    }
+
+    fn outcome(request_id: Uuid) -> HostOutcomeRecord {
+        HostOutcomeRecord {
+            request_id,
+            ts: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            outcome: HostOutcome::TransportFailure {
+                error: TransportError::PeerClosed,
             },
         }
     }
 
+    #[test]
+    fn intent_derives_authoritative_side_effect_and_dispatch_decision() {
+        let request_id = Uuid::new_v4();
+        let allowed = allowed_intent(request_id, 1);
+        assert_eq!(allowed.request_id, request_id);
+        assert_eq!(allowed.side_effect, SideEffect::Read);
+        assert_eq!(allowed.dispatch, DispatchDecision::Dispatch);
+
+        let denied = NewIntentRecord::from_request(
+            &request(request_id, 1),
+            BudgetDecision::Deny {
+                reason: "budget exhausted".to_owned(),
+            },
+            GateDecision::Allow,
+        );
+        assert_eq!(denied.side_effect, SideEffect::Read);
+        assert_eq!(denied.dispatch, DispatchDecision::DoNotDispatch);
+
+        let pending = NewIntentRecord::from_request(
+            &request(request_id, 1),
+            BudgetDecision::Allow,
+            GateDecision::PendingHuman,
+        );
+        assert_eq!(pending.dispatch, DispatchDecision::DoNotDispatch);
+    }
+
     #[tokio::test]
-    async fn append_is_in_order_and_persistent() {
+    async fn intent_and_outcome_streams_allocate_independent_sequences() {
         let sink = InMemoryAuditSink::new();
-        for s in [1u64, 2, 3] {
-            sink.append(make_event(s)).await.unwrap();
-        }
-        let got = sink.snapshot();
-        assert_eq!(got.len(), 3);
-        assert_eq!(got[0].seq, 1);
-        assert_eq!(got[2].seq, 3);
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+
+        let first_intent = sink
+            .append_intent(allowed_intent(first_id, 1))
+            .await
+            .unwrap();
+        let first_outcome_seq = sink.append_outcome(outcome(first_id)).await.unwrap();
+        let second_intent = sink
+            .append_intent(allowed_intent(second_id, 2))
+            .await
+            .unwrap();
+        let second_outcome_seq = sink.append_outcome(outcome(second_id)).await.unwrap();
+
+        assert_eq!(first_intent.seq, 1);
+        assert_eq!(second_intent.seq, 2);
+        assert_eq!(first_outcome_seq, 1);
+        assert_eq!(second_outcome_seq, 2);
+
+        let intents = sink.intent_snapshot().unwrap();
+        assert_eq!(intents.len(), 2);
+        assert_eq!(intents[0].request_id, first_id);
+        assert_eq!(intents[1].request_id, second_id);
+
+        let outcomes = sink.outcome_snapshot().unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].0, 1);
+        assert_eq!(outcomes[0].1.request_id, first_id);
+        assert_eq!(outcomes[1].0, 2);
+        assert_eq!(outcomes[1].1.request_id, second_id);
+    }
+
+    #[tokio::test]
+    async fn returned_snapshots_cannot_mutate_appended_records() {
+        let sink = InMemoryAuditSink::new();
+        let request_id = Uuid::new_v4();
+        sink.append_intent(allowed_intent(request_id, 1))
+            .await
+            .unwrap();
+        sink.append_outcome(outcome(request_id)).await.unwrap();
+
+        let mut intents = sink.intent_snapshot().unwrap();
+        let mut outcomes = sink.outcome_snapshot().unwrap();
+        intents.clear();
+        outcomes.clear();
+
+        assert_eq!(sink.intent_snapshot().unwrap().len(), 1);
+        assert_eq!(sink.outcome_snapshot().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn host_audit_records_round_trip_but_are_rejected_as_guest_evidence() {
+        let sink = InMemoryAuditSink::new();
+        let intent = sink
+            .append_intent(allowed_intent(Uuid::nil(), 1))
+            .await
+            .unwrap();
+        let intent_json = serde_json::to_value(&intent).unwrap();
+        assert_eq!(
+            serde_json::from_value::<IntentAuditRecord>(intent_json.clone()).unwrap(),
+            intent
+        );
+        assert!(serde_json::from_value::<GuestToHost>(intent_json).is_err());
+
+        let host_outcome = outcome(Uuid::nil());
+        let outcome_json = serde_json::to_value(&host_outcome).unwrap();
+        assert_eq!(
+            serde_json::from_value::<HostOutcomeRecord>(outcome_json).unwrap(),
+            host_outcome
+        );
+    }
+
+    #[test]
+    fn legacy_guest_audit_evidence_is_rejected() {
+        assert!(serde_json::from_value::<GuestToHost>(json!({
+            "kind": "audit_event",
+            "seq": 1,
+            "ts": "2023-11-14T22:13:20Z",
+            "intent": {
+                "kind": "read_proc",
+                "pid": 1,
+                "owner": "ai"
+            }
+        }))
+        .is_err());
     }
 }

@@ -13,6 +13,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+vsock.workspace = true
 introspect-schema.workspace = true
 
 # §13.1「这是最重要的库选择」。M1 第二刀接 ELF 符号化：
@@ -21,6 +24,9 @@ introspect-schema.workspace = true
 # 不要的：apk/breakpad/gsym 暂无用、zlib 等压缩留到 M4 飞行记录。
 # Mac 上 `default-features=false` pure-Rust 编译通过、零系统库依赖。
 blazesym = { version = "0.2", default-features = false, features = ["dwarf", "demangle"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
 
 [lib]
 name = "guest_agent"

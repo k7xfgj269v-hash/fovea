@@ -5,12 +5,19 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: check · test (ubuntu, stable)
+  linux:
+    name: M1 gates (Ubuntu, stable)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,21 +29,30 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # First real compilation. On ubuntu this reaches the
-      # #[cfg(target_os = "linux")] paths (BlazeSymbolizer, the real /proc I/O)
-      # that always cfg-out on Mac and have never been compiled.
-      - name: cargo check (all targets)
-        run: cargo check --all-targets --all-features
+      - name: cargo check
+        run: cargo check --locked --all-targets --all-features
 
       - name: cargo test
-        run: cargo test --all
+        run: cargo test --locked --all
 
-      # Style checks. The AI-written code has not been fmt/clippy'd yet, so these
-      # do not gate the build for now — drop `continue-on-error` once tidied.
       - name: cargo fmt --check
-        continue-on-error: true
         run: cargo fmt --all --check
 
       - name: cargo clippy
-        continue-on-error: true
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  macos:
+    name: Portable tests (macOS, stable)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test (portable cfg paths)
+        run: cargo test --locked --all
