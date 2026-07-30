@@ -13,8 +13,11 @@ the trusted control plane separate from the guest execution plane.
 ## Status
 
 - M0 executable QEMU/KVM host harness: landed.
-- M1 read-only `introspect(pid)` Level 0 shape: landed.
-- CI: Ubuntu Linux gates and macOS portable tests are passing.
+- M1 read-only `introspect(pid)` Level 0 with D7 anti-gaming acceptance: landed.
+- Captured Linux fixtures cover all nine scheduler states, lossy procfs text,
+  degraded maps, cgroup variants, confidence scoring, token estimates, and
+  measured snapshot spans.
+- CI includes Ubuntu live `/proc` acceptance and macOS portable gates.
 - M0 physical acceptance on a Linux x86_64 KVM host: pending.
 - Kernel-write and eBPF intervention capabilities: not exposed.
 
@@ -97,7 +100,7 @@ only cross-boundary contract.
 Requirements:
 
 - Rust stable, selected by `rust-toolchain.toml`.
-- Python 3 for the M0 contract tests.
+- Python 3 for the M0 contract tests and Linux live procfs fixture.
 - Linux x86_64, QEMU/KVM, GNU GDB, and explicit guest artifacts for physical
   M0 acceptance.
 
@@ -113,6 +116,31 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 The macOS test job validates portable code paths. Linux-only `/proc`, QEMU,
 KVM, and symbolization paths are validated by the Ubuntu CI job or a real
 Linux host.
+
+## M1 Acceptance
+
+The D7 acceptance suite is designed so constant substitutions and silent
+fallbacks do not pass. Fixtures are byte-exact Linux captures with recorded
+provenance; every degradation must remain visible in
+`confidence.low_fields`.
+
+Run the portable parser and Level 0 contracts:
+
+```bash
+cargo test --locked -p guest-agent --test d7_proc_view
+cargo test --locked -p guest-agent --test d7_proc_source
+cargo test --locked -p guest-agent --test d7_level0
+```
+
+On Linux, run the live non-UTF-8 and full numeric `/proc` PID gate:
+
+```bash
+cargo test --locked -p guest-agent --test d7_linux_live -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The live scan allows only normal process disappearance and permission
+failures. Parse failures and every other error class fail the gate.
 
 ## M0 Harness
 
@@ -163,7 +191,9 @@ reuse a guest disk before collecting required snapshot evidence.
 
 ## Current Limitations
 
-- The default M1 compatibility entry point uses `FallbackSymbolizer`.
+- The default M1 compatibility entry point uses `FallbackSymbolizer`; raw
+  kernel stack names are retained as Kallsyms evidence with reduced
+  confidence when richer symbolization fails.
 - `BlazeSymbolizer` is Linux-only, isolated, and not wired into the default
   compatibility path.
 - M0 scripts are tooling evidence, not physical KVM acceptance by themselves.

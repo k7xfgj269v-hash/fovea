@@ -12,8 +12,10 @@ Fovea 是运行在 Linux 之上的特权服务，为 AI operator 提供机器级
 ## 当前状态
 
 - M0 可执行 QEMU/KVM 宿主 harness：已落地。
-- M1 只读 `introspect(pid)` Level 0 形态：已落地。
-- CI：Ubuntu Linux gates 与 macOS 可移植测试通过。
+- M1 只读 `introspect(pid)` Level 0 与 D7 anti-gaming 验收：已落地。
+- Linux 真机 fixture 已覆盖九种调度状态、procfs 非 UTF-8、maps 降级、
+  cgroup 变体、置信度、token 估算与实际快照跨度。
+- CI 已包含 Ubuntu live `/proc` 验收与 macOS 可移植门。
 - Linux x86_64 KVM 主机上的 M0 物理验收：待完成。
 - 内核写能力与 eBPF 干预能力：尚未暴露。
 
@@ -96,7 +98,7 @@ guest agent 不引用 host supervisor。跨边界合同只有
 基础要求：
 
 - Rust stable，版本由 `rust-toolchain.toml` 选择。
-- Python 3，用于 M0 合同测试。
+- Python 3，用于 M0 合同测试与 Linux live procfs fixture。
 - 物理 M0 验收需要 Linux x86_64、QEMU/KVM、GNU GDB 和明确提供的 guest artifact。
 
 构建并测试 workspace：
@@ -110,6 +112,30 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 
 macOS job 用于验证可移植代码路径。Linux-only 的 `/proc`、QEMU、KVM 与符号化
 路径由 Ubuntu CI 或真实 Linux 主机验证。
+
+## M1 验收
+
+D7 验收的目标是让“换一个常数”和“静默吞掉降级”无法通过。fixture 来自
+按字节保存并记录 provenance 的 Linux 真机输出；任何降级都必须出现在
+`confidence.low_fields` 中。
+
+运行可移植的 parser 与 Level 0 合同：
+
+```bash
+cargo test --locked -p guest-agent --test d7_proc_view
+cargo test --locked -p guest-agent --test d7_proc_source
+cargo test --locked -p guest-agent --test d7_level0
+```
+
+在 Linux 上运行非 UTF-8 与全数字 `/proc` PID 真机门：
+
+```bash
+cargo test --locked -p guest-agent --test d7_linux_live -- \
+  --ignored --nocapture --test-threads=1
+```
+
+全 PID 扫描只允许进程正常退出和权限不足；任何 parse failure 或其他错误类别
+都会使验收失败。
 
 ## M0 Harness
 
@@ -155,7 +181,8 @@ QMP 与 GDB 都是未认证的控制接口。保持 socket 和端口只绑定 lo
 
 ## 当前限制
 
-- 默认 M1 兼容入口使用 `FallbackSymbolizer`。
+- 默认 M1 兼容入口使用 `FallbackSymbolizer`；更高档符号化失败时仍保留
+  Kallsyms 原始内核栈名字，并明确降低置信度。
 - `BlazeSymbolizer` 仅 Linux 可用，已隔离但尚未接入默认兼容路径。
 - M0 脚本只是工具链证据，不等于物理 KVM 验收。
 - Apple Silicon 和 CI 不等价于真实 Linux x86_64 KVM 主机。
