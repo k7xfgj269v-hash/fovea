@@ -11,6 +11,7 @@ use guest_agent::{
     introspect_with_inputs, CpuCounters, IntrospectService, ProcDegradation, ProcError,
     ProcSnapshot, ProcSource, SampleClock,
 };
+use introspect_schema::RunState;
 
 const FIXTURE_PID: i32 = 208_288;
 
@@ -64,19 +65,23 @@ impl Symbolizer for DwarfSymbolizer {
     }
 }
 
-fn captured_d_stat() -> String {
+fn captured_stat_with_state(state: u8) -> String {
     let mut stat = fixture_bytes("level0/stat");
     let state_offset = stat
         .windows(3)
         .position(|window| window[0] == b')' && window[1] == b' ' && window[2] == b'S')
         .expect("captured sleep stat must contain the S state byte")
         + 2;
-    stat[state_offset] = b'D';
+    stat[state_offset] = state;
     String::from_utf8(stat).expect("captured stat must remain UTF-8")
 }
 
+fn captured_d_stat() -> String {
+    captured_stat_with_state(b'D')
+}
+
 fn captured_s_stat() -> String {
-    String::from_utf8(fixture_bytes("level0/stat")).expect("captured stat must be UTF-8")
+    captured_stat_with_state(b'S')
 }
 
 fn captured_status_without_context_switches() -> String {
@@ -154,6 +159,164 @@ fn run_fixture(
 
 fn has_path(fields: &[LowConfidenceField], path: &str) -> bool {
     fields.iter().any(|field| field.path == path)
+}
+
+fn low_field<'a>(fields: &'a [LowConfidenceField], path: &str) -> &'a LowConfidenceField {
+    fields
+        .iter()
+        .find(|field| field.path == path)
+        .unwrap_or_else(|| panic!("missing low-confidence evidence for {path}"))
+}
+
+#[test]
+fn a1_unknown_state_falls_back_with_evidence_and_known_state_does_not() {
+    let (pid, unknown, end) = fixture_snapshot(
+        captured_stat_with_state(b'?'),
+        fixture_text("level0/status"),
+        Some(fixture_text("level0/wchan")),
+        Some(fixture_text("level0/cgroup").trim_end().to_owned()),
+        Some(fixture_text("level0/exe").trim_end().to_owned()),
+        None,
+        Vec::new(),
+    );
+    let unknown = run_fixture(pid, unknown, end, Arc::new(DwarfSymbolizer), Duration::ZERO);
+
+    assert_eq!(unknown.state.run_state, RunState::Unknown('?'));
+    assert!(has_path(&unknown.confidence.low_fields, "state.run_state"));
+
+    let (pid, known, end) = fixture_snapshot(
+        captured_s_stat(),
+        fixture_text("level0/status"),
+        Some(fixture_text("level0/wchan")),
+        Some(fixture_text("level0/cgroup").trim_end().to_owned()),
+        Some(fixture_text("level0/exe").trim_end().to_owned()),
+        None,
+        Vec::new(),
+    );
+    let known = run_fixture(pid, known, end, Arc::new(DwarfSymbolizer), Duration::ZERO);
+    assert_eq!(known.state.run_state, RunState::S);
+    assert!(!has_path(&known.confidence.low_fields, "state.run_state"));
+}
+
+#[test]
+fn a2_source_lossy_evidence_reaches_every_level0_path() {
+    let paths = [
+        "identity.comm",
+        "identity.uid",
+        "resource.ctxt_switches",
+        "mem_shape",
+        "state.wchan",
+        "hotspot.frames",
+        "identity.cgroup",
+        "identity.exe",
+        "identity.cmdline",
+    ];
+    let (pid, clean, end) = complete_d_snapshot();
+    let mut degraded = clean.clone();
+    degraded.degradations = paths
+        .iter()
+        .map(|path| {
+            ProcDegradation::new(
+                *path,
+                "captured proc input contained non-UTF-8 bytes and used U+FFFD replacement",
+            )
+        })
+        .collect();
+
+    let degraded = run_fixture(
+        pid,
+        degraded,
+        end,
+        Arc::new(DwarfSymbolizer),
+        Duration::ZERO,
+    );
+    for path in paths {
+        let field = low_field(&degraded.confidence.low_fields, path);
+        assert!(field.reason.contains("U+FFFD"));
+        assert_eq!(field.confidence, Some(SymbolConfidence::None));
+    }
+    assert!(degraded.confidence.overall < 1.0);
+
+    let clean = run_fixture(pid, clean, end, Arc::new(DwarfSymbolizer), Duration::ZERO);
+    assert!(clean.confidence.low_fields.is_empty());
+}
+
+#[test]
+fn a3_maps_skips_reach_level0_with_exact_count_and_clean_reverse() {
+    let (pid, clean, end) = complete_d_snapshot();
+    let mut degraded = clean.clone();
+    let mut lines = fixture_text("level0/maps")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert!(lines.len() > 2);
+    for line in lines.iter_mut().take(2) {
+        line.truncate(
+            line.find(' ')
+                .expect("captured maps line must contain an address separator"),
+        );
+    }
+    degraded.maps = format!("{}\n", lines.join("\n"));
+
+    let degraded = run_fixture(
+        pid,
+        degraded,
+        end,
+        Arc::new(DwarfSymbolizer),
+        Duration::ZERO,
+    );
+    let mem_shape = low_field(&degraded.confidence.low_fields, "mem_shape");
+    assert_eq!(mem_shape.reason, "skipped 2 malformed maps lines");
+
+    let clean = run_fixture(pid, clean, end, Arc::new(DwarfSymbolizer), Duration::ZERO);
+    assert!(!has_path(&clean.confidence.low_fields, "mem_shape"));
+}
+
+#[test]
+fn same_path_degradations_merge_reasons_and_keep_lowest_confidence() {
+    let (pid, mut snapshot, end) = complete_d_snapshot();
+    snapshot.degradations.push(ProcDegradation::new(
+        "hotspot.frames[0].symbol",
+        "stack source contained non-UTF-8 bytes and used U+FFFD replacement",
+    ));
+    let level0 = run_fixture(
+        pid,
+        snapshot,
+        end,
+        Arc::new(guest_agent::symbolize::FallbackSymbolizer),
+        Duration::ZERO,
+    );
+
+    let matching = level0
+        .confidence
+        .low_fields
+        .iter()
+        .filter(|field| field.path == "hotspot.frames[0].symbol")
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1);
+    assert_eq!(matching[0].confidence, Some(SymbolConfidence::None));
+    assert!(matching[0].reason.contains("retained raw kernel Kallsyms"));
+    assert!(matching[0].reason.contains("U+FFFD"));
+}
+
+#[test]
+fn missing_d_state_stack_is_explicit_and_complete_stack_is_clean() {
+    let (pid, complete, end) = complete_d_snapshot();
+    let mut missing = complete.clone();
+    missing.kernel_stack = None;
+    let missing = run_fixture(pid, missing, end, Arc::new(DwarfSymbolizer), Duration::ZERO);
+    let field = low_field(&missing.confidence.low_fields, "hotspot.frames");
+    assert!(field.reason.contains("D-state kernel stack unavailable"));
+    assert!(missing.confidence.overall < 1.0);
+
+    let complete = run_fixture(
+        pid,
+        complete,
+        end,
+        Arc::new(DwarfSymbolizer),
+        Duration::ZERO,
+    );
+    assert!(!has_path(&complete.confidence.low_fields, "hotspot.frames"));
 }
 
 #[test]
