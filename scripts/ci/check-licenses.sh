@@ -25,9 +25,10 @@ for manifest in crates/*/Cargo.toml; do
 done
 
 find bpf -type f -name '*.bpf.c' -print | while IFS= read -r source; do
-    grep -Fq '// SPDX-License-Identifier: (MIT OR GPL-2.0-only)' "$source" ||
-        fail "$source is missing the required SPDX declaration"
-    grep -Fq 'char LICENSE[] SEC("license") = "Dual MIT/GPL";' "$source" ||
+    first_line=$(sed -n '1p' "$source")
+    test "$first_line" = '// SPDX-License-Identifier: (MIT OR GPL-2.0-only)' ||
+        fail "$source must put the required SPDX declaration on line 1"
+    grep -Eq '^[[:space:]]*char LICENSE\[\] SEC\("license"\) = "Dual MIT/GPL";[[:space:]]*$' "$source" ||
         fail "$source is missing the required kernel runtime license"
 done
 
