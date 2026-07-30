@@ -91,9 +91,14 @@ mod tests {
                 "duplicate manifest path: {}",
                 record.path
             );
+            assert!(!record.captured_at.is_empty());
+            assert!(!record.kernel_release.is_empty());
+            assert!(!record.architecture.is_empty());
+            assert!(!record.command.is_empty());
         }
 
         assert_eq!(manifest_paths, fixture_files(&root));
+        assert!(fixture_text("status/cat.txt").contains("Name:"));
     }
 
     #[test]

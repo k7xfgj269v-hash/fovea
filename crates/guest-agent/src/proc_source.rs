@@ -1,6 +1,6 @@
 //! `/proc` access ports and the Linux procfs adapter.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -148,6 +148,7 @@ pub trait ProcSource: Send + Sync {
 
 /// Injectable wait used between CPU counter reads.
 pub trait SampleClock: Send + Sync {
+    fn now(&self) -> Instant;
     fn sleep(&self, duration: Duration);
 }
 
@@ -296,6 +297,10 @@ fn classify_proc_io(error: &std::io::Error, scope: ProcIoScope) -> ProcIoErrorCl
 pub struct ThreadSampleClock;
 
 impl SampleClock for ThreadSampleClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
     fn sleep(&self, duration: Duration) {
         std::thread::sleep(duration);
     }

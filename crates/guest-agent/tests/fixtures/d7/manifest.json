@@ -225,6 +225,126 @@
         "source": "https://github.com/lxc/lxc/issues/2845",
         "mutation": null
       }
+    },
+    {
+      "path": "level0/stat",
+      "kind": "level0_proc_stat",
+      "captured_at": "2026-07-29T17:59:44Z",
+      "kernel_release": "6.1.0-9-amd64",
+      "architecture": "x86_64",
+      "command": "cat /proc/<sleep-pid>/stat",
+      "state": "S",
+      "sha256": "ac6853a3d6d6c95b98e19ce1a372403fc365a3a92790d3096845af5e85021386",
+      "provenance": {
+        "kind": "captured",
+        "source": null,
+        "mutation": null
+      }
+    },
+    {
+      "path": "level0/status",
+      "kind": "proc_status",
+      "captured_at": "2026-07-29T17:59:44Z",
+      "kernel_release": "6.1.0-9-amd64",
+      "architecture": "x86_64",
+      "command": "cat /proc/<sleep-pid>/status",
+      "state": "S",
+      "sha256": "3e2dde7f7486a8783b1af79cba5c7ae69005ea426abac95a16b86940210a9020",
+      "provenance": {
+        "kind": "captured",
+        "source": null,
+        "mutation": null
+      }
+    },
+    {
+      "path": "level0/maps",
+      "kind": "proc_maps",
+      "captured_at": "2026-07-29T17:59:44Z",
+      "kernel_release": "6.1.0-9-amd64",
+      "architecture": "x86_64",
+      "command": "cat /proc/<sleep-pid>/maps",
+      "state": "S",
+      "sha256": "31dbdebd4658a0446b49f8e8a3e107369373348ebf73ec23d2a8bcb59744cc9a",
+      "provenance": {
+        "kind": "captured",
+        "source": null,
+        "mutation": null
+      }
+    },
+    {
+      "path": "level0/wchan",
+      "kind": "proc_wchan",
+      "captured_at": "2026-07-29T17:59:44Z",
+      "kernel_release": "6.1.0-9-amd64",
+      "architecture": "x86_64",
+      "command": "cat /proc/<sleep-pid>/wchan",
+      "state": "S",
+      "sha256": "d219f557a2b0cb82b3797466226ba7b3332eebe88fe1bd63afcd00607c1609d5",
+      "provenance": {
+        "kind": "captured",
+        "source": null,
+        "mutation": null
+      }
+    },
+    {
+      "path": "level0/stack",
+      "kind": "proc_stack",
+      "captured_at": "2026-07-29T17:59:44Z",
+      "kernel_release": "6.1.0-9-amd64",
+      "architecture": "x86_64",
+      "command": "cat /proc/<sleep-pid>/stack",
+      "state": "S",
+      "sha256": "2acb193a6987a631ba8c4948c48895d6e69ea9fd5bde341571748df6c1855972",
+      "provenance": {
+        "kind": "captured",
+        "source": null,
+        "mutation": null
+      }
+    },
+    {
+      "path": "level0/cgroup",
+      "kind": "proc_cgroup",
+      "captured_at": "2026-07-29T17:59:44Z",
+      "kernel_release": "6.1.0-9-amd64",
+      "architecture": "x86_64",
+      "command": "cat /proc/<sleep-pid>/cgroup",
+      "state": "S",
+      "sha256": "2bb562807151b8b6dc48233d1fe63ed9578b6fdd111d2d2ffd1f55e0d5b06ac2",
+      "provenance": {
+        "kind": "captured",
+        "source": null,
+        "mutation": null
+      }
+    },
+    {
+      "path": "level0/cmdline",
+      "kind": "proc_cmdline",
+      "captured_at": "2026-07-29T17:59:44Z",
+      "kernel_release": "6.1.0-9-amd64",
+      "architecture": "x86_64",
+      "command": "cat /proc/<sleep-pid>/cmdline",
+      "state": "S",
+      "sha256": "c00e6315ced3b62c5aa3624e14b4ec28606911d4e94a92b1189a433d058eddfa",
+      "provenance": {
+        "kind": "captured",
+        "source": null,
+        "mutation": null
+      }
+    },
+    {
+      "path": "level0/exe",
+      "kind": "proc_exe",
+      "captured_at": "2026-07-29T17:59:44Z",
+      "kernel_release": "6.1.0-9-amd64",
+      "architecture": "x86_64",
+      "command": "readlink /proc/<sleep-pid>/exe",
+      "state": "S",
+      "sha256": "5dc72a41fc7dd018ec8e1c104a7c168ad24c69431aa29ae52d8016fe61c31dbf",
+      "provenance": {
+        "kind": "captured",
+        "source": null,
+        "mutation": null
+      }
     }
   ]
 }
