@@ -33,6 +33,20 @@ pub enum SymbolizeError {
     WorkerPanic,
 }
 
+impl SymbolizeError {
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            SymbolizeError::NotFound { .. } => "not_found",
+            SymbolizeError::NoSymbolFile => "no_symbol_file",
+            SymbolizeError::Backend { .. } => "backend",
+            SymbolizeError::QueueFull => "queue_full",
+            SymbolizeError::Timeout => "timeout",
+            SymbolizeError::WorkerStopped => "worker_stopped",
+            SymbolizeError::WorkerPanic => "worker_panic",
+        }
+    }
+}
+
 pub trait Symbolizer: Send + Sync {
     fn symbolize(&self, addr: u64) -> Result<Symbolized, SymbolizeError>;
 
@@ -463,7 +477,7 @@ fn blaze_to_symbolized(
     match symbolized {
         blazesym::symbolize::Symbolized::Sym(symbol) => Ok(Symbolized {
             name: format!("{}+0x{:x}", symbol.name, symbol.offset),
-            source: blaze_confidence(&symbol),
+            source: kernel_blaze_confidence(&symbol),
         }),
         blazesym::symbolize::Symbolized::Unknown(blazesym::symbolize::Reason::MissingSyms) => {
             Err(SymbolizeError::NoSymbolFile)
@@ -475,13 +489,13 @@ fn blaze_to_symbolized(
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn blaze_confidence(symbol: &blazesym::symbolize::Sym<'_>) -> introspect_schema::SymbolConfidence {
+fn kernel_blaze_confidence(
+    symbol: &blazesym::symbolize::Sym<'_>,
+) -> introspect_schema::SymbolConfidence {
     use introspect_schema::SymbolConfidence;
 
     if symbol.code_info.is_some() {
         SymbolConfidence::Dwarf
-    } else if symbol.size.is_some() {
-        SymbolConfidence::Dynsym
     } else if !symbol.name.is_empty() {
         SymbolConfidence::Kallsyms
     } else {

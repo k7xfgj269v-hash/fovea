@@ -18,8 +18,12 @@ use crate::proc_view::{self, Stat, CMDLINE_SHORT_MAX, MEM_SHAPE_TOP_N};
 #[cfg(any(test, target_os = "linux"))]
 use crate::symbolize::FallbackSymbolizer;
 use crate::symbolize::Symbolizer;
+#[cfg(target_os = "linux")]
+use crate::symbolize::{spawn_kernel_symbolizer, SymbolizerWorkerConfig};
 
 pub const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(target_os = "linux")]
+const SYMBOLIZER_CONFIDENCE_PATH: &str = "hotspot.frames";
 
 /// Level 0 orchestration over injectable ports.
 pub struct IntrospectService {
@@ -64,13 +68,62 @@ pub fn introspect(pid: i32) -> Result<Level0, ProcError> {
     {
         use crate::proc_source::LinuxProcSource;
 
-        IntrospectService::new(
-            Arc::new(LinuxProcSource::new()),
-            Arc::new(FallbackSymbolizer),
-            Arc::new(ThreadSampleClock),
-            DEFAULT_SAMPLE_INTERVAL,
-        )
-        .introspect(pid)
+        let source = Arc::new(LinuxProcSource::new());
+        let clock = Arc::new(ThreadSampleClock);
+        match spawn_kernel_symbolizer(SymbolizerWorkerConfig::default()) {
+            Ok((client, handle)) => {
+                let result = IntrospectService::new(
+                    source,
+                    Arc::new(client),
+                    clock,
+                    DEFAULT_SAMPLE_INTERVAL,
+                )
+                .introspect(pid);
+                let shutdown = handle.shutdown();
+
+                match result {
+                    Ok(mut level0) => {
+                        if let Err(error) = shutdown {
+                            record_symbolizer_degradation(
+                                &mut level0,
+                                format!(
+                                    "symbolizer_shutdown_error_kind={}; worker_shutdown=failed; detail={error}",
+                                    error.kind()
+                                ),
+                            );
+                        }
+                        Ok(level0)
+                    }
+                    Err(error) => {
+                        if let Err(shutdown_error) = shutdown {
+                            tracing::warn!(
+                                error_kind = shutdown_error.kind(),
+                                error = %shutdown_error,
+                                "kernel symbolizer shutdown failed after introspection error"
+                            );
+                        }
+                        Err(error)
+                    }
+                }
+            }
+            Err(error) => {
+                let mut level0 = IntrospectService::new(
+                    source,
+                    Arc::new(FallbackSymbolizer),
+                    clock,
+                    DEFAULT_SAMPLE_INTERVAL,
+                )
+                .introspect(pid)?;
+                record_symbolizer_degradation(
+                    &mut level0,
+                    format!(
+                        "symbolizer_init_error_kind={}; fallback=raw_kallsyms; detail={error}",
+                        error.kind()
+                    ),
+                );
+                Ok(level0)
+            }
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -460,11 +513,14 @@ fn build_hotspot(
                 let confidence = symbol.source;
                 (Some(symbol), Some(confidence))
             }
-            Err(_) => {
+            Err(error) => {
                 low_fields.push(LowConfidenceField {
                     path: format!("hotspot.frames[{idx}].symbol"),
                     confidence: Some(SymbolConfidence::Kallsyms),
-                    reason: "symbolizer failed; retained raw kernel Kallsyms symbol".into(),
+                    reason: format!(
+                        "symbolizer failed: error_kind={}; fallback=raw_kallsyms; retained raw kernel Kallsyms symbol; detail={error}",
+                        error.kind()
+                    ),
                 });
                 (
                     Some(Symbolized {
@@ -572,6 +628,19 @@ fn merge_proc_degradations(
             degradation.reason.clone(),
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+fn record_symbolizer_degradation(level0: &mut Level0, reason: String) {
+    merge_low_confidence_field(
+        &mut level0.confidence.low_fields,
+        SYMBOLIZER_CONFIDENCE_PATH.into(),
+        SymbolConfidence::None,
+        reason,
+    );
+    level0.confidence.overall =
+        calculate_overall_confidence(&level0.hotspot, &level0.confidence.low_fields);
+    level0.cost_hint.token = estimate_level0_tokens(level0);
 }
 
 fn estimate_level0_tokens(level0: &Level0) -> u32 {
