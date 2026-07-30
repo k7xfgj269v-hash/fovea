@@ -35,6 +35,9 @@ jobs:
       - name: cargo test
         run: cargo test --locked --all
 
+      - name: D7 Linux live acceptance
+        run: cargo test --locked -p guest-agent --test d7_linux_live -- --ignored --nocapture --test-threads=1
+
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
