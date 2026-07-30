@@ -16,6 +16,7 @@
 //!  ├─ resource    RSS/VSZ, fd 数, %cpu(短采样), ctxt-switch
 //!  ├─ mem_shape   区段直方图 + top-N 大映射        ← 投影本体
 //!  ├─ hotspot     D 态时内核栈顶 3-5 帧(每帧带置信度)
+//!  ├─ snapshot_span_ms  顺序读取窗口长度
 //!  ├─ recent      复用常驻飞行记录仪的事件聚合      ← 零新增探针
 //!  ├─ confidence  本次快照整体可信度摘要(§11)
 //!  ├─ handles     不透明游标 {threads,maps,stack,fds,env,symbols}
@@ -40,6 +41,12 @@ pub struct Level0 {
     pub resource: Resource,
     pub mem_shape: MemShape,
     pub hotspot: Hotspot,
+    /// 顺序读取 `/proc` 文件及 CPU 短采样实际覆盖的观察窗口。
+    ///
+    /// 这不是原子读承诺：它描述从 snapshot 开始到最后一次 CPU counter
+    /// 读取结束之间的时间跨度。
+    #[serde(default)]
+    pub snapshot_span_ms: u64,
     /// `recent` 是§10 唯一「不是纯读 /proc」的字段——它复用常驻飞行记录仪
     /// 的数据。常驻记录仪自身是系统级探针、不是本调用引入的，所以「本调用
     /// 增量扰动为零」依然成立（§10「零探针」精确含义）。
@@ -534,6 +541,7 @@ mod tests {
                     confidence: Some(SymbolConfidence::Dwarf),
                 }],
             },
+            snapshot_span_ms: 17,
             recent: RecentEvents::RecorderOff,
             confidence: ConfidenceSummary {
                 overall: 0.85,
@@ -541,7 +549,7 @@ mod tests {
             },
             handles: Handles::default(),
             cost_hint: CostHint {
-                token: 500,
+                token: 321,
                 api_cost: None,
                 overhead_est_ns: 0,
             },
@@ -550,8 +558,9 @@ mod tests {
         let back: Level0 = serde_json::from_str(&s).unwrap();
         assert_eq!(back.identity.pid, 42);
         assert_eq!(back.state.run_state, RunState::D);
+        assert_eq!(back.snapshot_span_ms, 17);
         assert!(matches!(back.recent, RecentEvents::RecorderOff));
-        assert_eq!(back.cost_hint.token, 500);
+        assert_eq!(back.cost_hint.token, 321);
         // 皇冠明珠体检：完整 maps 没出现在 JSON 里（只有 kind 聚合 + top-N）
         let json_val: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert!(json_val["mem_shape"]["histogram"].is_array());

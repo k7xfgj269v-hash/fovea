@@ -4,7 +4,7 @@
 //! filesystem access is isolated in [`crate::proc_source::LinuxProcSource`].
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use introspect_schema::{
     ConfidenceSummary, CostHint, Handles, Hotspot, Identity, Level0, LowConfidenceField, ProcState,
@@ -108,6 +108,7 @@ fn introspect_from_ports(
     pid: i32,
 ) -> Result<Level0, ProcError> {
     validate_requested_pid(pid)?;
+    let snapshot_started = clock.now();
     let snapshot = source.snapshot(pid)?;
     validate_page_size(snapshot.page_size_bytes)?;
     let stat = proc_view::parse_stat(&snapshot.stat)?;
@@ -126,8 +127,16 @@ fn introspect_from_ports(
         start,
         snapshot.logical_cpus,
     )?;
+    let snapshot_span_ms = measured_snapshot_span_ms(snapshot_started, clock.now());
 
-    build_level0(pid, &snapshot, stat, cpu_sample, symbolizer)
+    build_level0(
+        pid,
+        &snapshot,
+        stat,
+        cpu_sample,
+        snapshot_span_ms,
+        symbolizer,
+    )
 }
 
 fn validate_requested_pid(pid: i32) -> Result<(), ProcError> {
@@ -197,6 +206,13 @@ fn sample_cpu(
     Ok(calculate_cpu_percent(start, end, logical_cpus))
 }
 
+fn measured_snapshot_span_ms(started: Instant, finished: Instant) -> u64 {
+    finished
+        .duration_since(started)
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
 fn calculate_cpu_percent(start: CpuCounters, end: CpuCounters, logical_cpus: u32) -> CpuSample {
     let Some(process_delta) = end.process_ticks.checked_sub(start.process_ticks) else {
         return CpuSample::unavailable("CPU 短采样进程计数器回退");
@@ -224,11 +240,12 @@ fn build_level0(
     snapshot: &ProcSnapshot,
     stat: Stat,
     cpu_sample: CpuSample,
+    snapshot_span_ms: u64,
     symbolizer: &dyn Symbolizer,
 ) -> Result<Level0, ProcError> {
     let status = proc_view::parse_status(&snapshot.status)?;
-    let mem_shape = proc_view::parse_maps(&snapshot.maps)?;
-    let nr_fds = proc_view::scan_fds_from_names(&snapshot.fd_names);
+    let parsed_maps = proc_view::parse_maps_with_diagnostics(&snapshot.maps)?;
+    let mem_shape = parsed_maps.mem_shape.clone();
     let wchan_raw = snapshot
         .wchan
         .as_deref()
@@ -263,7 +280,7 @@ fn build_level0(
     let resource = Resource {
         rss_bytes: stat.rss.saturating_mul(snapshot.page_size_bytes),
         vsz_bytes: stat.vsize,
-        nr_fds,
+        nr_fds: snapshot.nr_fds,
         pct_cpu: cpu_sample.pct_cpu,
         ctxt_switches: introspect_schema::CtxtSwitches {
             voluntary: status.voluntary_ctxt_switches,
@@ -271,8 +288,70 @@ fn build_level0(
         },
     };
 
-    let hotspot = build_hotspot(run_state, &kernel_stack, symbolizer);
-    let mut confidence = build_confidence(&wchan_raw, &hotspot, symbolizer);
+    let (hotspot, hotspot_low_fields) = build_hotspot(run_state, &kernel_stack, symbolizer);
+    let mut confidence = build_confidence(
+        &wchan_raw,
+        &kernel_stack,
+        &hotspot,
+        symbolizer,
+        hotspot_low_fields,
+    );
+    merge_proc_degradations(&mut confidence.low_fields, &snapshot.degradations);
+    merge_proc_degradations(&mut confidence.low_fields, &parsed_maps.degradations);
+
+    if matches!(run_state, RunState::Unknown(_)) {
+        merge_low_confidence_field(
+            &mut confidence.low_fields,
+            "state.run_state".into(),
+            SymbolConfidence::None,
+            "unknown kernel run state preserved as a forward-compatible fallback".into(),
+        );
+    }
+    if matches!(run_state, RunState::S | RunState::D) && wchan_raw.is_none() {
+        merge_low_confidence_field(
+            &mut confidence.low_fields,
+            "state.wchan".into(),
+            SymbolConfidence::None,
+            "sleeping or blocked state has no readable wchan".into(),
+        );
+    }
+    let missing_context_switches = [
+        (
+            !status.has_voluntary_ctxt_switches,
+            "voluntary_ctxt_switches",
+        ),
+        (
+            !status.has_nonvoluntary_ctxt_switches,
+            "nonvoluntary_ctxt_switches",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(missing, name)| missing.then_some(name))
+    .collect::<Vec<_>>();
+    if !missing_context_switches.is_empty() {
+        merge_low_confidence_field(
+            &mut confidence.low_fields,
+            "resource.ctxt_switches".into(),
+            SymbolConfidence::None,
+            format!("status missing {}", missing_context_switches.join(" and ")),
+        );
+    }
+    if snapshot.cgroup.is_none() {
+        merge_low_confidence_field(
+            &mut confidence.low_fields,
+            "identity.cgroup".into(),
+            SymbolConfidence::None,
+            "cgroup path unavailable".into(),
+        );
+    }
+    if snapshot.exe.is_none() {
+        merge_low_confidence_field(
+            &mut confidence.low_fields,
+            "identity.exe".into(),
+            SymbolConfidence::None,
+            "exe target unavailable".into(),
+        );
+    }
     if let Some(reason) = cpu_sample.low_confidence_reason {
         merge_low_confidence_field(
             &mut confidence.low_fields,
@@ -281,22 +360,26 @@ fn build_level0(
             reason,
         );
     }
+    confidence.overall = calculate_overall_confidence(&hotspot, &confidence.low_fields);
 
-    Ok(Level0 {
+    let mut level0 = Level0 {
         identity,
         state,
         resource,
         mem_shape,
         hotspot,
+        snapshot_span_ms,
         recent: RecentEvents::RecorderOff,
         confidence,
         handles: Handles::default(),
         cost_hint: CostHint {
-            token: 500,
+            token: 0,
             api_cost: None,
             overhead_est_ns: 0,
         },
-    })
+    };
+    level0.cost_hint.token = estimate_level0_tokens(&level0);
+    Ok(level0)
 }
 
 /// Pure compatibility helper used by portable parser/domain tests.
@@ -313,23 +396,25 @@ pub fn introspect_with_inputs(
     symbolizer: &dyn Symbolizer,
 ) -> Result<Level0, ProcError> {
     validate_requested_pid(pid)?;
+    let nr_fds = proc_view::scan_fds_from_names(fd_names);
     let snapshot = ProcSnapshot {
         stat: stat_s.to_string(),
         status: status_s.to_string(),
         maps: maps_s.to_string(),
         wchan: Some(wchan_s.to_string()),
         cmdline: cmdline_bytes.to_vec(),
-        fd_names: fd_names.to_vec(),
+        nr_fds,
         kernel_stack: Some(stack_s.to_string()),
         exe: None,
         cgroup: None,
+        degradations: Vec::new(),
         system_cpu_ticks: 0,
         logical_cpus: 1,
         page_size_bytes: 4096,
     };
     let stat = proc_view::parse_stat(stat_s)?;
     validate_snapshot_pid(pid, stat.pid)?;
-    build_level0(pid, &snapshot, stat, CpuSample::valid(0.0), symbolizer)
+    build_level0(pid, &snapshot, stat, CpuSample::valid(0.0), 0, symbolizer)
 }
 
 fn build_cmdline(bytes: &[u8]) -> introspect_schema::Cmdline {
@@ -350,21 +435,45 @@ fn build_hotspot(
     run_state: RunState,
     kernel_stack: &[(String, String)],
     symbolizer: &dyn Symbolizer,
-) -> Hotspot {
-    if run_state != RunState::D || kernel_stack.is_empty() {
-        return Hotspot::NotBlocked;
+) -> (Hotspot, Vec<LowConfidenceField>) {
+    if run_state != RunState::D {
+        return (Hotspot::NotBlocked, Vec::new());
+    }
+    if kernel_stack.is_empty() {
+        return (
+            Hotspot::Blocked { frames: Vec::new() },
+            vec![LowConfidenceField {
+                path: "hotspot.frames".into(),
+                confidence: Some(SymbolConfidence::None),
+                reason: "D-state kernel stack unavailable".into(),
+            }],
+        );
     }
 
     let take_n = MEM_SHAPE_TOP_N.min(kernel_stack.len());
     let mut frames = Vec::with_capacity(take_n);
-    for (idx, (addr_s, _raw_symbol)) in kernel_stack.iter().take(take_n).enumerate() {
+    let mut low_fields = Vec::new();
+    for (idx, (addr_s, raw_symbol)) in kernel_stack.iter().take(take_n).enumerate() {
         let addr = u64::from_str_radix(addr_s.trim_start_matches("0x"), 16).unwrap_or(0);
         let (symbol, confidence) = match symbolizer.symbolize(addr) {
             Ok(symbol) => {
                 let confidence = symbol.source;
                 (Some(symbol), Some(confidence))
             }
-            Err(_) => (None, None),
+            Err(_) => {
+                low_fields.push(LowConfidenceField {
+                    path: format!("hotspot.frames[{idx}].symbol"),
+                    confidence: Some(SymbolConfidence::Kallsyms),
+                    reason: "symbolizer failed; retained raw kernel Kallsyms symbol".into(),
+                });
+                (
+                    Some(Symbolized {
+                        name: raw_symbol.clone(),
+                        source: SymbolConfidence::Kallsyms,
+                    }),
+                    Some(SymbolConfidence::Kallsyms),
+                )
+            }
         };
         frames.push(StackFrame {
             idx: idx as u32,
@@ -373,21 +482,21 @@ fn build_hotspot(
             confidence,
         });
     }
-    Hotspot::Blocked { frames }
+    (Hotspot::Blocked { frames }, low_fields)
 }
 
 fn build_confidence(
     wchan_raw: &Option<String>,
+    raw_kernel_stack: &[(String, String)],
     hotspot: &Hotspot,
-    symbolizer: &dyn Symbolizer,
+    _symbolizer: &dyn Symbolizer,
+    initial_low_fields: Vec<LowConfidenceField>,
 ) -> ConfidenceSummary {
-    let mut low_fields = Vec::new();
-    let mut symbol_scores = Vec::new();
+    let mut low_fields = initial_low_fields;
 
     if let Hotspot::Blocked { frames } = hotspot {
         for frame in frames {
             let confidence = frame_symbol_confidence(frame);
-            symbol_scores.push(confidence.score());
             if confidence == SymbolConfidence::None {
                 merge_low_confidence_field(
                     &mut low_fields,
@@ -399,44 +508,77 @@ fn build_confidence(
         }
     }
 
-    let mut cross_check_failed = false;
     let top_frame = match hotspot {
         Hotspot::Blocked { frames } => frames.first(),
         Hotspot::NotBlocked => None,
     };
     if let (Some(wchan_name), Some(top_frame)) = (wchan_raw, top_frame) {
-        let top_addr =
-            u64::from_str_radix(top_frame.addr.trim_start_matches("0x"), 16).unwrap_or(0);
-        if let Some(reason) = symbolizer.cross_check(top_addr, wchan_name) {
-            cross_check_failed = true;
-            merge_low_confidence_field(
-                &mut low_fields,
-                "state.wchan".into(),
-                SymbolConfidence::Kallsyms,
-                reason.clone(),
-            );
-            merge_low_confidence_field(
-                &mut low_fields,
-                format!("hotspot.frames[{}].symbol", top_frame.idx),
-                frame_symbol_confidence(top_frame),
-                format!("wchan/top frame cross-check failed: {reason}"),
-            );
+        if let Some((_, raw_top_symbol)) = raw_kernel_stack.first() {
+            let expected = normalize_kernel_symbol(wchan_name);
+            let actual = normalize_kernel_symbol(raw_top_symbol);
+            if actual != expected {
+                let reason = format!("wchan/top frame mismatch: wchan={expected}, stack={actual}");
+                let top_path = format!("hotspot.frames[{}].symbol", top_frame.idx);
+                merge_low_confidence_field(
+                    &mut low_fields,
+                    "state.wchan".into(),
+                    SymbolConfidence::Kallsyms,
+                    reason.clone(),
+                );
+                merge_low_confidence_field(
+                    &mut low_fields,
+                    top_path,
+                    frame_symbol_confidence(top_frame),
+                    reason,
+                );
+            }
         }
     }
 
-    let mut overall = if symbol_scores.is_empty() {
-        1.0
-    } else {
-        symbol_scores.iter().sum::<f32>() / symbol_scores.len() as f32
-    };
-    if cross_check_failed {
-        overall = overall.min(0.5);
-    }
-
     ConfidenceSummary {
-        overall,
+        overall: calculate_overall_confidence(hotspot, &low_fields),
         low_fields,
     }
+}
+
+fn normalize_kernel_symbol(value: &str) -> &str {
+    value.trim().split('+').next().unwrap_or(value.trim())
+}
+
+fn calculate_overall_confidence(hotspot: &Hotspot, low_fields: &[LowConfidenceField]) -> f32 {
+    let symbol_component = match hotspot {
+        Hotspot::Blocked { frames } if !frames.is_empty() => {
+            frames
+                .iter()
+                .map(frame_symbol_confidence)
+                .map(SymbolConfidence::score)
+                .sum::<f32>()
+                / frames.len() as f32
+        }
+        _ => 1.0,
+    };
+    (symbol_component / (1.0 + 0.1 * low_fields.len() as f32)).clamp(0.0, 1.0)
+}
+
+fn merge_proc_degradations(
+    low_fields: &mut Vec<LowConfidenceField>,
+    degradations: &[crate::ProcDegradation],
+) {
+    for degradation in degradations {
+        merge_low_confidence_field(
+            low_fields,
+            degradation.path.clone(),
+            SymbolConfidence::None,
+            degradation.reason.clone(),
+        );
+    }
+}
+
+fn estimate_level0_tokens(level0: &Level0) -> u32 {
+    let mut canonical = level0.clone();
+    canonical.cost_hint.token = 0;
+    let json_bytes = serde_json::to_vec(&canonical).expect("Level0 must serialize");
+    ((json_bytes.len() as u64).saturating_add(3) / 4).min(u32::MAX as u64) as u32
 }
 
 fn frame_symbol_confidence(frame: &StackFrame) -> SymbolConfidence {
@@ -525,10 +667,11 @@ mod tests {
             maps: "".into(),
             wchan: None,
             cmdline: b"./demo\0--foo\0".to_vec(),
-            fd_names: vec!["0".into(), "1".into(), "2".into()],
+            nr_fds: 3,
             kernel_stack: None,
             exe: Some("/usr/bin/demo".into()),
             cgroup: Some("/user.slice/demo.scope".into()),
+            degradations: Vec::new(),
             system_cpu_ticks: 1_000,
             logical_cpus: 4,
             page_size_bytes: 4096,
@@ -569,11 +712,21 @@ mod tests {
     #[derive(Default)]
     struct RecordingClock {
         sleeps: Mutex<Vec<Duration>>,
+        now: Mutex<Option<std::time::Instant>>,
     }
 
     impl SampleClock for RecordingClock {
+        fn now(&self) -> std::time::Instant {
+            let mut now = self.now.lock().unwrap();
+            let current = now.get_or_insert_with(std::time::Instant::now);
+            *current
+        }
+
         fn sleep(&self, duration: Duration) {
             self.sleeps.lock().unwrap().push(duration);
+            let mut now = self.now.lock().unwrap();
+            let current = now.get_or_insert_with(std::time::Instant::now);
+            *current += duration;
         }
     }
 
@@ -603,7 +756,7 @@ mod tests {
         snapshot.maps = "7f0000000000-7f0000100000 rw-p 00000000 00:00 0 [heap]\n".into();
         snapshot.wchan = Some("futex_wait_queue_me\n".into());
         snapshot.cmdline = b"/usr/bin/demo\0--mode\0contract\0".to_vec();
-        snapshot.fd_names = vec![".".into(), "..".into(), "0".into(), "1".into()];
+        snapshot.nr_fds = 2;
         snapshot.kernel_stack = Some("[<0000000000000001>] futex_wait_queue_me+0x1/0x2\n".into());
         let source = Arc::new(MockProcSource::new(
             snapshot,
@@ -644,6 +797,31 @@ mod tests {
             Hotspot::Blocked { ref frames } if frames.len() == 1
         ));
         assert_eq!(*clock.sleeps.lock().unwrap(), [interval]);
+    }
+
+    #[test]
+    fn injected_sampling_intervals_produce_different_snapshot_spans() {
+        let source_a = Arc::new(MockProcSource::new(
+            base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4096, 1, 0)),
+            [Ok(cpu_counters(170, 1_200))],
+        ));
+        let interval_a = Duration::from_millis(2);
+        let level_a = service(source_a, Arc::new(RecordingClock::default()), interval_a)
+            .introspect(42)
+            .expect("first clocked snapshot must succeed");
+
+        let source_b = Arc::new(MockProcSource::new(
+            base_snapshot(stat_line(42, "demo", "S", 100, 50, 2, 4096, 1, 0)),
+            [Ok(cpu_counters(170, 1_200))],
+        ));
+        let interval_b = Duration::from_millis(11);
+        let level_b = service(source_b, Arc::new(RecordingClock::default()), interval_b)
+            .introspect(42)
+            .expect("second clocked snapshot must succeed");
+
+        assert_eq!(level_a.snapshot_span_ms, interval_a.as_millis() as u64);
+        assert_eq!(level_b.snapshot_span_ms, interval_b.as_millis() as u64);
+        assert_ne!(level_a.snapshot_span_ms, level_b.snapshot_span_ms);
     }
 
     #[test]
@@ -867,7 +1045,10 @@ mod tests {
         assert!(matches!(level0.hotspot, Hotspot::Blocked { .. }));
         assert!(matches!(level0.recent, RecentEvents::RecorderOff));
         assert!(level0.handles.threads.is_none());
-        assert_eq!(level0.cost_hint.token, 500);
+        let json_bytes = serde_json::to_string(&level0).unwrap().len() as f32;
+        let token_ratio = level0.cost_hint.token as f32 / json_bytes;
+        assert_ne!(level0.cost_hint.token, 500);
+        assert!((0.2..=1.0 / 3.0).contains(&token_ratio));
         assert!(level0.cost_hint.api_cost.is_none());
         assert_eq!(level0.cost_hint.overhead_est_ns, 0);
     }
@@ -1146,8 +1327,8 @@ mod tests {
             ("2".to_string(), "frame_2".to_string()),
         ];
         let symbolizer = SuccessfulSymbolizer;
-        let hotspot = build_hotspot(RunState::D, &stack, &symbolizer);
-        let confidence = build_confidence(&None, &hotspot, &symbolizer);
+        let (hotspot, low_fields) = build_hotspot(RunState::D, &stack, &symbolizer);
+        let confidence = build_confidence(&None, &stack, &hotspot, &symbolizer, low_fields);
 
         assert!((confidence.overall - 0.875).abs() < f32::EPSILON);
         assert!(confidence.low_fields.is_empty());
@@ -1175,15 +1356,15 @@ mod tests {
             ("3".to_string(), "frame_3".to_string()),
         ];
         let symbolizer = PartiallyFailingSymbolizer;
-        let hotspot = build_hotspot(RunState::D, &stack, &symbolizer);
-        let confidence = build_confidence(&None, &hotspot, &symbolizer);
+        let (hotspot, low_fields) = build_hotspot(RunState::D, &stack, &symbolizer);
+        let confidence = build_confidence(&None, &stack, &hotspot, &symbolizer, low_fields);
 
-        assert!((confidence.overall - (1.0 / 3.0)).abs() < f32::EPSILON);
+        assert!((confidence.overall - (2.5 / 3.0 / 1.2)).abs() < f32::EPSILON);
         assert!(confidence.overall < SymbolConfidence::Dwarf.score());
         assert_eq!(confidence.low_fields.len(), 2);
         for (idx, field) in confidence.low_fields.iter().enumerate() {
             assert_eq!(field.path, format!("hotspot.frames[{}].symbol", idx + 1));
-            assert_eq!(field.confidence, Some(SymbolConfidence::None));
+            assert_eq!(field.confidence, Some(SymbolConfidence::Kallsyms));
         }
     }
 
@@ -1203,10 +1384,16 @@ mod tests {
     fn failed_cross_check_caps_overall_confidence() {
         let stack = vec![("1".to_string(), "frame".to_string())];
         let symbolizer = CrossCheckFailureSymbolizer;
-        let hotspot = build_hotspot(RunState::D, &stack, &symbolizer);
-        let confidence = build_confidence(&Some("wchan".into()), &hotspot, &symbolizer);
+        let (hotspot, low_fields) = build_hotspot(RunState::D, &stack, &symbolizer);
+        let confidence = build_confidence(
+            &Some("wchan".into()),
+            &stack,
+            &hotspot,
+            &symbolizer,
+            low_fields,
+        );
 
-        assert_eq!(confidence.overall, 0.5);
+        assert!((confidence.overall - (1.0 / 1.2)).abs() < f32::EPSILON);
         let paths: Vec<_> = confidence
             .low_fields
             .iter()
@@ -1237,18 +1424,24 @@ mod tests {
     fn failed_top_symbol_and_cross_check_merge_confidence_evidence() {
         let stack = vec![("1".to_string(), "frame".to_string())];
         let symbolizer = SymbolizationAndCrossCheckFailureSymbolizer;
-        let hotspot = build_hotspot(RunState::D, &stack, &symbolizer);
-        let confidence = build_confidence(&Some("wchan".into()), &hotspot, &symbolizer);
+        let (hotspot, low_fields) = build_hotspot(RunState::D, &stack, &symbolizer);
+        let confidence = build_confidence(
+            &Some("wchan".into()),
+            &stack,
+            &hotspot,
+            &symbolizer,
+            low_fields,
+        );
 
-        assert_eq!(confidence.overall, 0.0);
+        assert!((confidence.overall - (0.75 / 1.2)).abs() < f32::EPSILON);
         let top_fields: Vec<_> = confidence
             .low_fields
             .iter()
             .filter(|field| field.path == "hotspot.frames[0].symbol")
             .collect();
         assert_eq!(top_fields.len(), 1);
-        assert_eq!(top_fields[0].confidence, Some(SymbolConfidence::None));
-        assert!(top_fields[0].reason.contains("symbolization failed"));
+        assert_eq!(top_fields[0].confidence, Some(SymbolConfidence::Kallsyms));
+        assert!(top_fields[0].reason.contains("symbolizer failed"));
         assert!(top_fields[0].reason.contains("wchan/top frame mismatch"));
     }
 

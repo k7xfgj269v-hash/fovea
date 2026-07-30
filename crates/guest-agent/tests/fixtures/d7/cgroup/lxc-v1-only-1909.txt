@@ -1,0 +1,12 @@
+12:freezer:/lxc/ca0cc7d3-33b2-4b5d-a78a-d0a46fcfd2f5
+11:perf_event:/lxc/ca0cc7d3-33b2-4b5d-a78a-d0a46fcfd2f5
+10:pids:/lxc/ca0cc7d3-33b2-4b5d-a78a-d0a46fcfd2f5
+9:cpuset:/lxc/ca0cc7d3-33b2-4b5d-a78a-d0a46fcfd2f5
+8:memory:/lxc/ca0cc7d3-33b2-4b5d-a78a-d0a46fcfd2f5
+7:devices:/lxc/ca0cc7d3-33b2-4b5d-a78a-d0a46fcfd2f5
+6:cpu,cpuacct:/lxc/ca0cc7d3-33b2-4b5d-a78a-d0a46fcfd2f5
+5:net_cls,net_prio:/lxc/ca0cc7d3-33b2-4b5d-a78a-d0a46fcfd2f5
+4:blkio:/lxc/ca0cc7d3-33b2-4b5d-a78a-d0a46fcfd2f5
+3:hugetlb:/lxc/ca0cc7d3-33b2-4b5d-a78a-d0a46fcfd2f5
+2:rdma:/lxc/ca0cc7d3-33b2-4b5d-a78a-d0a46fcfd2f5
+1:name=systemd:/lxc/ca0cc7d3-33b2-4b5d-a78a-d0a46fcfd2f5
