@@ -1,0 +1,20 @@
+Fovea eBPF programs in this directory are dual-licensed under:
+
+    MIT OR GPL-2.0-only
+
+You may use each file under either license at your option.
+
+Every `*.bpf.c` file must carry:
+
+    // SPDX-License-Identifier: (MIT OR GPL-2.0-only)
+
+and must declare this exact Linux BPF runtime license string:
+
+    char LICENSE[] SEC("license") = "Dual MIT/GPL";
+
+The runtime declaration is part of the program's kernel-loading contract. It
+does not replace the source file's SPDX license declaration.
+
+The MIT license text is available in the repository root `LICENSE` file. The
+GPL-2.0-only license text is published by the Free Software Foundation and the
+Linux kernel project.
