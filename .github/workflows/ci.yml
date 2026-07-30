@@ -29,6 +29,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: License declarations
+        run: scripts/ci/check-licenses.sh
+
       - name: cargo check
         run: cargo check --locked --all-targets --all-features
 
