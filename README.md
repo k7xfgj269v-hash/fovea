@@ -13,10 +13,12 @@ the trusted control plane separate from the guest execution plane.
 ## Status
 
 - M0 executable QEMU/KVM host harness: landed.
-- M1 read-only `introspect(pid)` Level 0 with D7 anti-gaming acceptance: landed.
-- Captured Linux fixtures cover all nine scheduler states, lossy procfs text,
-  degraded maps, cgroup variants, confidence scoring, token estimates, and
-  measured snapshot spans.
+- M1 read-only `introspect(pid)` Level 0 with D7 functional acceptance: landed.
+- Linux fixtures directly capture `R/S/D/Z/T/t/I`; the kernel-only/transient
+  `P/X` parser cases remain explicitly byte-derived and do not claim strict
+  direct-capture acceptance.
+- Fixtures also cover lossy procfs text, degraded maps, cgroup variants,
+  confidence scoring, token estimates, and measured snapshot spans.
 - CI includes Ubuntu live `/proc` acceptance and macOS portable gates.
 - M0 physical acceptance on a Linux x86_64 KVM host: pending.
 - Kernel-write and eBPF intervention capabilities: not exposed.
@@ -120,9 +122,14 @@ Linux host.
 ## M1 Acceptance
 
 The D7 acceptance suite is designed so constant substitutions and silent
-fallbacks do not pass. Fixtures are byte-exact Linux captures with recorded
-provenance; every degradation must remain visible in
-`confidence.low_fields`.
+fallbacks do not pass. Every fixture records whether it is a direct Linux
+capture, an external capture, or a documented derivation; every degradation
+must remain visible in `confidence.low_fields`.
+
+`scripts/fixtures/capture-proc-states.c` reproduces direct `R/S/D/Z/T/t/I`
+captures. `P` requires a parked kernel thread and `X` is an exit-state race, so
+their current parser fixtures are identified as derived instead of being
+misrepresented as machine captures.
 
 Run the portable parser and Level 0 contracts:
 

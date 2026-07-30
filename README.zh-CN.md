@@ -12,9 +12,11 @@ Fovea 是运行在 Linux 之上的特权服务，为 AI operator 提供机器级
 ## 当前状态
 
 - M0 可执行 QEMU/KVM 宿主 harness：已落地。
-- M1 只读 `introspect(pid)` Level 0 与 D7 anti-gaming 验收：已落地。
-- Linux 真机 fixture 已覆盖九种调度状态、procfs 非 UTF-8、maps 降级、
-  cgroup 变体、置信度、token 估算与实际快照跨度。
+- M1 只读 `introspect(pid)` Level 0 与 D7 功能验收：已落地。
+- Linux fixture 已直接捕获 `R/S/D/Z/T/t/I`；仅内核可稳定制造或极短暂的
+  `P/X` 仍明确标记为单字节派生，不冒充严格真机捕获。
+- fixture 还覆盖 procfs 非 UTF-8、maps 降级、cgroup 变体、置信度、
+  token 估算与实际快照跨度。
 - CI 已包含 Ubuntu live `/proc` 验收与 macOS 可移植门。
 - Linux x86_64 KVM 主机上的 M0 物理验收：待完成。
 - 内核写能力与 eBPF 干预能力：尚未暴露。
@@ -115,9 +117,13 @@ macOS job 用于验证可移植代码路径。Linux-only 的 `/proc`、QEMU、KV
 
 ## M1 验收
 
-D7 验收的目标是让“换一个常数”和“静默吞掉降级”无法通过。fixture 来自
-按字节保存并记录 provenance 的 Linux 真机输出；任何降级都必须出现在
+D7 验收的目标是让“换一个常数”和“静默吞掉降级”无法通过。每份 fixture
+都会记录它是 Linux 直接捕获、外部捕获还是明确派生；任何降级都必须出现在
 `confidence.low_fields` 中。
+
+`scripts/fixtures/capture-proc-states.c` 可复现 `R/S/D/Z/T/t/I` 的直接捕获。
+`P` 需要 parked 内核线程，`X` 是退出阶段竞态，因此当前 parser fixture
+明确标记为派生，不把它们伪装成真机 dump。
 
 运行可移植的 parser 与 Level 0 合同：
 
