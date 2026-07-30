@@ -4,27 +4,27 @@
     {
       "path": "stat/stat-running.txt",
       "kind": "proc_stat",
-      "captured_at": "2026-07-29T13:07:48Z",
+      "captured_at": "2026-07-30T03:42:43Z",
       "kernel_release": "5.15.0-171-generic",
       "architecture": "x86_64",
-      "command": "cat /proc/1/stat",
+      "command": "gcc -O2 -Wall -Wextra capture-proc-states.c; ./capture-proc-states OUTPUT_DIR",
       "state": "R",
-      "sha256": "aed115dd7d4023b00696424cac382cc9af36d30f1b008484a7a44d5987b1a60f",
+      "sha256": "302710d46a14a990919c71f95dacdfd53bce2ee4a9473c7fb338c3c1e2d01741",
       "provenance": {
-        "kind": "derived_state_byte",
-        "source": "stat/stat-sleeping.txt",
-        "mutation": "zero-based byte offset 12 changed from S to R; all other bytes unchanged"
+        "kind": "captured",
+        "source": null,
+        "mutation": null
       }
     },
     {
       "path": "stat/stat-sleeping.txt",
       "kind": "proc_stat",
-      "captured_at": "2026-07-29T13:07:48Z",
+      "captured_at": "2026-07-30T03:42:43Z",
       "kernel_release": "5.15.0-171-generic",
       "architecture": "x86_64",
-      "command": "cat /proc/1/stat",
+      "command": "gcc -O2 -Wall -Wextra capture-proc-states.c; ./capture-proc-states OUTPUT_DIR",
       "state": "S",
-      "sha256": "9ae6643cfc5e7a560d7bdd377d73db3bacaac2946c0a054bb969843226d6de39",
+      "sha256": "f8b2a6979bd6bc33d0ec747fab7cbc21954025383747d3297cb77286e6b9963f",
       "provenance": {
         "kind": "captured",
         "source": null,
@@ -34,106 +34,106 @@
     {
       "path": "stat/stat-disk-sleep.txt",
       "kind": "proc_stat",
-      "captured_at": "2026-07-29T13:07:48Z",
+      "captured_at": "2026-07-30T03:42:43Z",
       "kernel_release": "5.15.0-171-generic",
       "architecture": "x86_64",
-      "command": "cat /proc/1/stat",
+      "command": "gcc -O2 -Wall -Wextra capture-proc-states.c; ./capture-proc-states OUTPUT_DIR",
       "state": "D",
-      "sha256": "f99b02bc548d8432fb0809a90938fd38d2fcdf32e154691ab65021bb3d8965f1",
+      "sha256": "b2e076e10b21a05ad8eeb9ba33b0a4fac524a18c96330fcdbfb3c984e8202dc2",
       "provenance": {
-        "kind": "derived_state_byte",
-        "source": "stat/stat-sleeping.txt",
-        "mutation": "zero-based byte offset 12 changed from S to D; all other bytes unchanged"
+        "kind": "captured",
+        "source": null,
+        "mutation": null
       }
     },
     {
       "path": "stat/stat-zombie.txt",
       "kind": "proc_stat",
-      "captured_at": "2026-07-29T13:07:48Z",
+      "captured_at": "2026-07-30T03:42:43Z",
       "kernel_release": "5.15.0-171-generic",
       "architecture": "x86_64",
-      "command": "cat /proc/1/stat",
+      "command": "gcc -O2 -Wall -Wextra capture-proc-states.c; ./capture-proc-states OUTPUT_DIR",
       "state": "Z",
-      "sha256": "06c07d632ce6f45b08e77fd2e6525c0e3d6d6d8cb30eeaca2d707d2ffa916a37",
+      "sha256": "cad70885e2319f3a85db3f6f3ed2730e108434c190e6b187f6f0b94282a6e71b",
       "provenance": {
-        "kind": "derived_state_byte",
-        "source": "stat/stat-sleeping.txt",
-        "mutation": "zero-based byte offset 12 changed from S to Z; all other bytes unchanged"
+        "kind": "captured",
+        "source": null,
+        "mutation": null
       }
     },
     {
       "path": "stat/stat-stopped.txt",
       "kind": "proc_stat",
-      "captured_at": "2026-07-29T13:07:48Z",
+      "captured_at": "2026-07-30T03:42:43Z",
       "kernel_release": "5.15.0-171-generic",
       "architecture": "x86_64",
-      "command": "cat /proc/1/stat",
+      "command": "gcc -O2 -Wall -Wextra capture-proc-states.c; ./capture-proc-states OUTPUT_DIR",
       "state": "T",
-      "sha256": "783b3ca96b3bdf39f198f49347f9aa9f249ad27ca89c1fed988c9d23ea8c5039",
+      "sha256": "e0854a71afa26afde0982cf56a12ed9bd4a9351a25f9cf4b4bdc6c8c6d14166a",
       "provenance": {
-        "kind": "derived_state_byte",
-        "source": "stat/stat-sleeping.txt",
-        "mutation": "zero-based byte offset 12 changed from S to T; all other bytes unchanged"
+        "kind": "captured",
+        "source": null,
+        "mutation": null
       }
     },
     {
       "path": "stat/stat-tracing-stop.txt",
       "kind": "proc_stat",
-      "captured_at": "2026-07-29T13:07:48Z",
+      "captured_at": "2026-07-30T03:42:43Z",
       "kernel_release": "5.15.0-171-generic",
       "architecture": "x86_64",
-      "command": "cat /proc/1/stat",
+      "command": "gcc -O2 -Wall -Wextra capture-proc-states.c; ./capture-proc-states OUTPUT_DIR",
       "state": "t",
-      "sha256": "e38e59d8817e1b87aa61696b8c6d1063dfe799726099f29743d5096008e3e543",
+      "sha256": "574d199b923a899ee81191c0c08c16d8f2c54dca926ac3a615a4b97804f0d6df",
       "provenance": {
-        "kind": "derived_state_byte",
-        "source": "stat/stat-sleeping.txt",
-        "mutation": "zero-based byte offset 12 changed from S to t; all other bytes unchanged"
+        "kind": "captured",
+        "source": null,
+        "mutation": null
       }
     },
     {
       "path": "stat/stat-dead.txt",
       "kind": "proc_stat",
-      "captured_at": "2026-07-29T13:07:48Z",
+      "captured_at": "2026-07-30T03:42:43Z",
       "kernel_release": "5.15.0-171-generic",
       "architecture": "x86_64",
-      "command": "cat /proc/1/stat",
+      "command": "replace zero-based byte offset 26 in stat/stat-sleeping.txt for parser coverage",
       "state": "X",
-      "sha256": "2243a8bce6d2686ac42aeebf7834ed9984854afa938c4e52a6f637ca6c8eede0",
+      "sha256": "8d995e0c835e08eb21ba02efd638d93cc496ad23adfcedcf1ede478821f34200",
       "provenance": {
         "kind": "derived_state_byte",
         "source": "stat/stat-sleeping.txt",
-        "mutation": "zero-based byte offset 12 changed from S to X; all other bytes unchanged"
+        "mutation": "zero-based byte offset 26 changed from S to X; all other bytes unchanged"
       }
     },
     {
       "path": "stat/stat-parked.txt",
       "kind": "proc_stat",
-      "captured_at": "2026-07-29T13:07:48Z",
+      "captured_at": "2026-07-30T03:42:43Z",
       "kernel_release": "5.15.0-171-generic",
       "architecture": "x86_64",
-      "command": "cat /proc/1/stat",
+      "command": "replace zero-based byte offset 26 in stat/stat-sleeping.txt for parser coverage",
       "state": "P",
-      "sha256": "b9752ddd521fdfd0439ad88f4823470e23d5f0579ceec65e12bd0eac8a437b09",
+      "sha256": "351d24091a9472bc1700fe82819601f137f9c314b5190ecd1deb51439acd8da2",
       "provenance": {
         "kind": "derived_state_byte",
         "source": "stat/stat-sleeping.txt",
-        "mutation": "zero-based byte offset 12 changed from S to P; all other bytes unchanged"
+        "mutation": "zero-based byte offset 26 changed from S to P; all other bytes unchanged"
       }
     },
     {
       "path": "stat/stat-idle.txt",
       "kind": "proc_stat",
-      "captured_at": "2026-07-29T13:07:48Z",
+      "captured_at": "2026-07-30T03:42:43Z",
       "kernel_release": "5.15.0-171-generic",
       "architecture": "x86_64",
-      "command": "cat /proc/1/stat",
+      "command": "gcc -O2 -Wall -Wextra capture-proc-states.c; ./capture-proc-states OUTPUT_DIR",
       "state": "I",
-      "sha256": "dc9390e0961499215d1da24f16a6ac3b459498b6f5dd809637660bbc3726c182",
+      "sha256": "077e09aea982b4ed3cdbdafabdd456c09ae53208d417117a1577d39eaefa090e",
       "provenance": {
-        "kind": "derived_state_byte",
-        "source": "stat/stat-sleeping.txt",
-        "mutation": "zero-based byte offset 12 changed from S to I; all other bytes unchanged"
+        "kind": "captured",
+        "source": null,
+        "mutation": null
       }
     },
     {

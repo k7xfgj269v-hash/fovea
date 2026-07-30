@@ -8,7 +8,7 @@ use guest_agent::ProcError;
 use introspect_schema::RunState;
 
 #[test]
-fn all_captured_run_states_parse_and_unknown_falls_back() {
+fn all_kernel_run_state_codes_parse_and_unknown_falls_back() {
     assert_eq!(
         STATE_FIXTURES.map(|(state, _)| state),
         ['R', 'S', 'D', 'Z', 'T', 't', 'X', 'P', 'I']
@@ -16,7 +16,7 @@ fn all_captured_run_states_parse_and_unknown_falls_back() {
 
     for (state, _) in STATE_FIXTURES {
         let fixture = String::from_utf8(stat_fixture(state)).expect("stat fixture must be UTF-8");
-        let parsed = parse_stat(&fixture).expect("captured state must parse");
+        let parsed = parse_stat(&fixture).expect("documented state fixture must parse");
         assert_eq!(parsed.state, RunState::from_char(state));
     }
 

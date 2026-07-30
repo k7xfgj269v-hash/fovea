@@ -114,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn derived_state_fixtures_change_only_the_documented_state_byte() {
+    fn stat_fixture_provenance_is_explicit_and_mutations_are_single_byte() {
         let manifest = manifest();
         let records: BTreeMap<_, _> = manifest
             .fixtures
@@ -139,9 +139,35 @@ mod tests {
             .collect();
 
         assert_eq!(stat_paths, indexed_paths);
-        assert_eq!(captured_stats.len(), 1);
-        assert_eq!(captured_stats[0].state.as_deref(), Some("S"));
-        assert_eq!(derived_stats.len(), STATE_FIXTURES.len() - 1);
+        let captured_states: BTreeSet<_> = captured_stats
+            .iter()
+            .map(|record| {
+                record
+                    .state
+                    .as_deref()
+                    .expect("captured stat needs a state")
+            })
+            .collect();
+        let derived_states: BTreeSet<_> = derived_stats
+            .iter()
+            .map(|record| record.state.as_deref().expect("derived stat needs a state"))
+            .collect();
+
+        assert_eq!(
+            captured_states,
+            BTreeSet::from(["D", "I", "R", "S", "T", "Z", "t"])
+        );
+        assert_eq!(derived_states, BTreeSet::from(["P", "X"]));
+
+        for record in captured_stats {
+            assert!(record.provenance.source.is_none());
+            assert!(record.provenance.mutation.is_none());
+            assert!(
+                record.command.contains("capture-proc-states"),
+                "captured stat must name its capture program: {}",
+                record.path
+            );
+        }
 
         for record in derived_stats {
             let source_path = record
