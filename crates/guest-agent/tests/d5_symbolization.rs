@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use common::d7_fixtures::{fixture_bytes, fixture_text, stat_fixture};
 use guest_agent::introspect::{
-    assemble_default_introspection, estimate_level0_tokens, IntrospectionSymbolizerWorker,
+    assemble_default_introspection, estimate_level0_tokens, kernel_introspection_symbolizer_worker,
+    IntrospectionSymbolizerWorker,
 };
 use guest_agent::proc_view::{parse_stat, read_kernel_stack_from_str};
 use guest_agent::schema::{Hotspot, LowConfidenceField, SymbolConfidence, Symbolized};
@@ -258,6 +259,30 @@ fn successful_default_assembly_returns_sentinel_worker_symbols_without_fallback(
     assert!(low_fields_at(&level0.confidence.low_fields, "hotspot.frames").is_empty());
     assert_eq!(level0.confidence.overall, 1.0);
     assert_eq!(level0.cost_hint.token, estimate_level0_tokens(&level0));
+}
+
+#[test]
+fn idle_real_worker_consumed_by_production_wrapper_shuts_down_cleanly() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let symbolizer: Arc<dyn Symbolizer> = Arc::new(SentinelSymbolizer {
+        calls: Arc::clone(&calls),
+    });
+    let (client, handle) = spawn_injected_symbolizer_worker(
+        SymbolizerWorkerConfig {
+            queue_capacity: 1,
+            request_timeout: Duration::from_secs(1),
+        },
+        symbolizer,
+    )
+    .expect("injected worker must start");
+    let worker = kernel_introspection_symbolizer_worker(client, handle);
+
+    assert_eq!(worker.shutdown(), Ok(()));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "shutdown must not invoke the injected symbolizer"
+    );
 }
 
 #[test]

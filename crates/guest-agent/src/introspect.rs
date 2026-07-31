@@ -16,8 +16,10 @@ use crate::proc_source::ThreadSampleClock;
 use crate::proc_source::{CpuCounters, ProcError, ProcSnapshot, ProcSource, SampleClock};
 use crate::proc_view::{self, Stat, CMDLINE_SHORT_MAX, MEM_SHAPE_TOP_N};
 #[cfg(target_os = "linux")]
-use crate::symbolize::{spawn_kernel_symbolizer, SymbolizerWorkerConfig, SymbolizerWorkerHandle};
-use crate::symbolize::{FallbackSymbolizer, SymbolizeError, Symbolizer};
+use crate::symbolize::{spawn_kernel_symbolizer, SymbolizerWorkerConfig};
+use crate::symbolize::{
+    FallbackSymbolizer, SymbolizeError, Symbolizer, SymbolizerWorkerClient, SymbolizerWorkerHandle,
+};
 
 pub const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const SYMBOLIZER_CONFIDENCE_PATH: &str = "hotspot.frames";
@@ -71,11 +73,7 @@ pub fn introspect(pid: i32) -> Result<Level0, ProcError> {
             Arc::new(ThreadSampleClock),
             DEFAULT_SAMPLE_INTERVAL,
             || match spawn_kernel_symbolizer(SymbolizerWorkerConfig::default()) {
-                Ok((client, handle)) => Ok(Box::new(KernelIntrospectionSymbolizerWorker {
-                    client: Arc::new(client),
-                    handle,
-                })
-                    as Box<dyn IntrospectionSymbolizerWorker>),
+                Ok((client, handle)) => Ok(kernel_introspection_symbolizer_worker(client, handle)),
                 Err(error) => Err(error),
             },
         )
@@ -94,22 +92,33 @@ pub trait IntrospectionSymbolizerWorker {
     fn shutdown(self: Box<Self>) -> Result<(), SymbolizeError>;
 }
 
-#[cfg(target_os = "linux")]
 struct KernelIntrospectionSymbolizerWorker {
     client: Arc<dyn Symbolizer>,
     handle: SymbolizerWorkerHandle,
 }
 
-#[cfg(target_os = "linux")]
 impl IntrospectionSymbolizerWorker for KernelIntrospectionSymbolizerWorker {
     fn symbolizer(&self) -> &dyn Symbolizer {
         self.client.as_ref()
     }
 
     fn shutdown(self: Box<Self>) -> Result<(), SymbolizeError> {
-        let Self { handle, .. } = *self;
-        handle.shutdown()
+        let Self { client, handle } = *self;
+        let result = handle.shutdown();
+        drop(client);
+        result
     }
+}
+
+#[doc(hidden)]
+pub fn kernel_introspection_symbolizer_worker(
+    client: SymbolizerWorkerClient,
+    handle: SymbolizerWorkerHandle,
+) -> Box<dyn IntrospectionSymbolizerWorker> {
+    Box::new(KernelIntrospectionSymbolizerWorker {
+        client: Arc::new(client),
+        handle,
+    })
 }
 
 #[doc(hidden)]
