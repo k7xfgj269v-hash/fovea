@@ -38,8 +38,10 @@ not accepted as success.
   `confidence.low_fields`, lowers confidence, and updates the final token
   estimate.
 - Matching wchan/top-frame names do not raise a warning; mismatches do.
-- Linux CI requires two distinct nonzero `/proc/kallsyms` names to match
-  blazesym output. Restricted or zeroed kallsyms fails the prerequisite.
+- Linux CI requires two distinct nonzero `/proc/kallsyms` addresses and two
+  distinct resolved names. Each blazesym result must belong to the full alias
+  set reported for its address; restricted or zeroed kallsyms fails the
+  prerequisite. A constant symbolizer still cannot pass.
 
 Deferred D5 optimization work includes debuginfod, build-ID keyed caches,
 stripped-binary recovery, and JIT symbol sources.
@@ -82,6 +84,17 @@ Local acceptance completed on 2026-07-31:
   constant output, bypassed worker objects, missing shutdown, and
   drop-before-shutdown implementations.
 
+GitHub Linux acceptance completed on 2026-07-31 for commit `1b13467`
+(Actions run `30631582370`):
+
+- Full workspace tests, formatting, Clippy, and license gates: passed.
+- D7 live `/proc` acceptance: 3 passed, 0 failed.
+- `kernel.kptr_restrict=0` was applied and observed by the job.
+- D5 live blazesym acceptance: 1 passed, 0 failed. The gate accepted legitimate
+  same-address Kallsyms aliases while retaining the distinct-address and
+  distinct-name reverse assertions.
+- macOS portable tests: passed in the same workflow run.
+
 Local portable gates:
 
 ```bash
@@ -115,9 +128,9 @@ Forge evidence for the current D5 delivery is retained at:
 ## Unverified Assumptions
 
 - No local QEMU/KVM guest acceptance was run on this Apple Silicon machine.
-- The ignored D5 live symbolization test can only be executed by Linux CI or a
-  suitable Linux host; local verification covers portable behavior and the
-  Linux compile target.
+- The D5 live symbolization result is proven on the GitHub Ubuntu runner, not
+  on every supported kernel configuration; local verification covers portable
+  behavior and the Linux compile target.
 - Physical M0 acceptance on a Linux x86_64 KVM host remains pending.
 - D5 debuginfod, cache, stripped-binary, and JIT quality assumptions remain
   intentionally unverified because those optimizations are outside this
