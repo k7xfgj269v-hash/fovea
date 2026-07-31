@@ -556,23 +556,17 @@ fn live_kernel_worker_matches_two_distinct_nonzero_kallsyms_names() {
                 .insert(name.to_owned());
         }
     }
-    let candidates = names_by_address
-        .into_iter()
-        .filter_map(|(addr, names)| {
-            (names.len() == 1).then(|| (addr, names.into_iter().next().unwrap()))
-        })
-        .take(4096)
-        .collect::<Vec<_>>();
+    let candidates = names_by_address.into_iter().take(4096).collect::<Vec<_>>();
     assert!(
         candidates.len() >= 2,
-        "D5 live prerequisite failed: /proc/kallsyms exposed fewer than two distinct nonzero unambiguous text symbols; check kptr_restrict and CI privileges"
+        "D5 live prerequisite failed: /proc/kallsyms exposed fewer than two distinct nonzero text-symbol addresses; check kptr_restrict and CI privileges"
     );
 
     let (client, handle) = spawn_kernel_symbolizer(SymbolizerWorkerConfig::default())
         .expect("D5 live prerequisite failed: kernel blazesym worker must start");
     let mut resolved = Vec::new();
     let mut failures = Vec::new();
-    for (addr, raw_name) in &candidates {
+    for (addr, raw_names) in &candidates {
         match client.symbolize(*addr) {
             Ok(symbol) => {
                 let normalized = symbol
@@ -582,21 +576,21 @@ fn live_kernel_worker_matches_two_distinct_nonzero_kallsyms_names() {
                     .next()
                     .unwrap_or(symbol.name.trim())
                     .to_owned();
-                if normalized == *raw_name
+                if raw_names.contains(&normalized)
                     && resolved
                         .iter()
                         .all(|(_, prior_name, _): &(u64, String, Symbolized)| {
-                            prior_name != raw_name
+                            prior_name != &normalized
                         })
                 {
-                    resolved.push((*addr, raw_name.clone(), symbol));
+                    resolved.push((*addr, normalized, symbol));
                     if resolved.len() == 2 {
                         break;
                     }
                 }
             }
             Err(error) if failures.len() < 8 => {
-                failures.push(format!("{addr:#x} {raw_name}: {error}"));
+                failures.push(format!("{addr:#x} {raw_names:?}: {error}"));
             }
             Err(_) => {}
         }

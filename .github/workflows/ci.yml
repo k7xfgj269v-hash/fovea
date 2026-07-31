@@ -44,14 +44,14 @@ jobs:
       - name: Expose kernel symbols for D5 live acceptance
         run: sudo sysctl -w kernel.kptr_restrict=0
 
-      - name: D5 Linux live symbolization
-        run: cargo test --locked -p guest-agent --test d5_symbolization -- --ignored --nocapture --test-threads=1
-
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
       - name: cargo clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: D5 Linux live symbolization
+        run: sudo env "PATH=$PATH" "CARGO_HOME=$CARGO_HOME" "RUSTUP_HOME=$HOME/.rustup" cargo test --locked -p guest-agent --test d5_symbolization -- --ignored --nocapture --test-threads=1
 
   macos:
     name: Portable tests (macOS, stable)
