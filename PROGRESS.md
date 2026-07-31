@@ -69,6 +69,19 @@ stripped-binary recovery, and JIT symbol sources.
 
 ## Verification
 
+Local acceptance completed on 2026-07-31:
+
+- License gate: passed.
+- Rust workspace: 149 tests passed, 0 failed.
+- Formatting and Clippy with warnings denied: passed.
+- `x86_64-unknown-linux-gnu` all-targets/all-features check: passed.
+- M0 host checks: 25 passed.
+- M0 VM launcher checks: 19 passed.
+- M0 QMP contract checks: 10 passed.
+- D5 final review: passed. The combined real-worker contract rejected
+  constant output, bypassed worker objects, missing shutdown, and
+  drop-before-shutdown implementations.
+
 Local portable gates:
 
 ```bash
