@@ -2,10 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::mpsc::{
+    self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError,
+};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -31,6 +33,23 @@ pub enum SymbolizeError {
     WorkerStopped,
     #[error("符号化 worker panic")]
     WorkerPanic,
+    #[error("符号化 worker 关闭超时")]
+    ShutdownTimeout,
+}
+
+impl SymbolizeError {
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            SymbolizeError::NotFound { .. } => "not_found",
+            SymbolizeError::NoSymbolFile => "no_symbol_file",
+            SymbolizeError::Backend { .. } => "backend",
+            SymbolizeError::QueueFull => "queue_full",
+            SymbolizeError::Timeout => "timeout",
+            SymbolizeError::WorkerStopped => "worker_stopped",
+            SymbolizeError::WorkerPanic => "worker_panic",
+            SymbolizeError::ShutdownTimeout => "shutdown_timeout",
+        }
+    }
 }
 
 pub trait Symbolizer: Send + Sync {
@@ -185,6 +204,7 @@ pub struct SymbolizerWorkerClient {
     requests: SyncSender<SymbolizeRequest>,
     request_timeout: Duration,
     lifecycle: Arc<WorkerLifecycle>,
+    _liveness: Arc<()>,
 }
 
 impl SymbolizerWorkerClient {
@@ -255,13 +275,27 @@ pub struct SymbolizerWorkerHandle {
     shutdown: mpsc::Sender<()>,
     join: Option<JoinHandle<()>>,
     lifecycle: Arc<WorkerLifecycle>,
+    shutdown_timeout: Duration,
+    client_liveness: Weak<()>,
+    shutdown_probe: Option<Sender<usize>>,
 }
 
 impl SymbolizerWorkerHandle {
     pub fn shutdown(mut self) -> Result<(), SymbolizeError> {
+        if let Some(probe) = &self.shutdown_probe {
+            let _ = probe.send(self.client_liveness.strong_count());
+        }
         let shutdown_requested = self.lifecycle.request_shutdown();
         let _ = self.shutdown.send(());
         let join = self.join.take().ok_or(SymbolizeError::WorkerStopped)?;
+        let started = Instant::now();
+        while !join.is_finished() {
+            let elapsed = started.elapsed();
+            if elapsed >= self.shutdown_timeout {
+                return Err(SymbolizeError::ShutdownTimeout);
+            }
+            thread::sleep(WORKER_POLL_INTERVAL.min(self.shutdown_timeout - elapsed));
+        }
         match join.join() {
             Ok(()) if shutdown_requested => Ok(()),
             Ok(()) => Err(SymbolizeError::WorkerStopped),
@@ -292,9 +326,52 @@ pub fn spawn_kernel_symbolizer(
     }
 }
 
+struct InjectedSymbolizerBackend {
+    symbolizer: Arc<dyn Symbolizer>,
+}
+
+impl WorkerBackend for InjectedSymbolizerBackend {
+    fn symbolize(&mut self, addr: u64) -> Result<Symbolized, SymbolizeError> {
+        self.symbolizer.symbolize(addr)
+    }
+}
+
+#[doc(hidden)]
+pub fn spawn_injected_symbolizer_worker(
+    config: SymbolizerWorkerConfig,
+    symbolizer: Arc<dyn Symbolizer>,
+) -> Result<(SymbolizerWorkerClient, SymbolizerWorkerHandle), SymbolizeError> {
+    spawn_worker(config, move || Ok(InjectedSymbolizerBackend { symbolizer }))
+}
+
+#[doc(hidden)]
+pub fn spawn_injected_symbolizer_worker_with_shutdown_probe(
+    config: SymbolizerWorkerConfig,
+    symbolizer: Arc<dyn Symbolizer>,
+    shutdown_probe: Sender<usize>,
+) -> Result<(SymbolizerWorkerClient, SymbolizerWorkerHandle), SymbolizeError> {
+    spawn_worker_with_shutdown_probe(
+        config,
+        move || Ok(InjectedSymbolizerBackend { symbolizer }),
+        Some(shutdown_probe),
+    )
+}
+
 fn spawn_worker<B, F>(
     config: SymbolizerWorkerConfig,
     factory: F,
+) -> Result<(SymbolizerWorkerClient, SymbolizerWorkerHandle), SymbolizeError>
+where
+    B: WorkerBackend + 'static,
+    F: FnOnce() -> Result<B, SymbolizeError> + Send + 'static,
+{
+    spawn_worker_with_shutdown_probe(config, factory, None)
+}
+
+fn spawn_worker_with_shutdown_probe<B, F>(
+    config: SymbolizerWorkerConfig,
+    factory: F,
+    shutdown_probe: Option<Sender<usize>>,
 ) -> Result<(SymbolizerWorkerClient, SymbolizerWorkerHandle), SymbolizeError>
 where
     B: WorkerBackend + 'static,
@@ -333,18 +410,26 @@ where
         })?;
 
     match initialized_rx.recv() {
-        Ok(Ok(())) => Ok((
-            SymbolizerWorkerClient {
-                requests,
-                request_timeout: config.request_timeout,
-                lifecycle: Arc::clone(&lifecycle),
-            },
-            SymbolizerWorkerHandle {
-                shutdown,
-                join: Some(join),
-                lifecycle,
-            },
-        )),
+        Ok(Ok(())) => {
+            let client_liveness = Arc::new(());
+            let handle_liveness = Arc::downgrade(&client_liveness);
+            Ok((
+                SymbolizerWorkerClient {
+                    requests,
+                    request_timeout: config.request_timeout,
+                    lifecycle: Arc::clone(&lifecycle),
+                    _liveness: client_liveness,
+                },
+                SymbolizerWorkerHandle {
+                    shutdown,
+                    join: Some(join),
+                    lifecycle,
+                    shutdown_timeout: config.request_timeout,
+                    client_liveness: handle_liveness,
+                    shutdown_probe,
+                },
+            ))
+        }
         Ok(Err(error)) => {
             let _ = join.join();
             Err(error)
@@ -463,7 +548,7 @@ fn blaze_to_symbolized(
     match symbolized {
         blazesym::symbolize::Symbolized::Sym(symbol) => Ok(Symbolized {
             name: format!("{}+0x{:x}", symbol.name, symbol.offset),
-            source: blaze_confidence(&symbol),
+            source: kernel_blaze_confidence(&symbol),
         }),
         blazesym::symbolize::Symbolized::Unknown(blazesym::symbolize::Reason::MissingSyms) => {
             Err(SymbolizeError::NoSymbolFile)
@@ -475,13 +560,13 @@ fn blaze_to_symbolized(
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn blaze_confidence(symbol: &blazesym::symbolize::Sym<'_>) -> introspect_schema::SymbolConfidence {
+fn kernel_blaze_confidence(
+    symbol: &blazesym::symbolize::Sym<'_>,
+) -> introspect_schema::SymbolConfidence {
     use introspect_schema::SymbolConfidence;
 
     if symbol.code_info.is_some() {
         SymbolConfidence::Dwarf
-    } else if symbol.size.is_some() {
-        SymbolConfidence::Dynsym
     } else if !symbol.name.is_empty() {
         SymbolConfidence::Kallsyms
     } else {
