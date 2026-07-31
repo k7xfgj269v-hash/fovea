@@ -15,11 +15,14 @@ use introspect_schema::{
 use crate::proc_source::ThreadSampleClock;
 use crate::proc_source::{CpuCounters, ProcError, ProcSnapshot, ProcSource, SampleClock};
 use crate::proc_view::{self, Stat, CMDLINE_SHORT_MAX, MEM_SHAPE_TOP_N};
-#[cfg(any(test, target_os = "linux"))]
-use crate::symbolize::FallbackSymbolizer;
-use crate::symbolize::Symbolizer;
+#[cfg(target_os = "linux")]
+use crate::symbolize::{spawn_kernel_symbolizer, SymbolizerWorkerConfig};
+use crate::symbolize::{
+    FallbackSymbolizer, SymbolizeError, Symbolizer, SymbolizerWorkerClient, SymbolizerWorkerHandle,
+};
 
 pub const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+const SYMBOLIZER_CONFIDENCE_PATH: &str = "hotspot.frames";
 
 /// Level 0 orchestration over injectable ports.
 pub struct IntrospectService {
@@ -64,19 +67,126 @@ pub fn introspect(pid: i32) -> Result<Level0, ProcError> {
     {
         use crate::proc_source::LinuxProcSource;
 
-        IntrospectService::new(
+        assemble_default_introspection(
+            pid,
             Arc::new(LinuxProcSource::new()),
-            Arc::new(FallbackSymbolizer),
             Arc::new(ThreadSampleClock),
             DEFAULT_SAMPLE_INTERVAL,
+            || match spawn_kernel_symbolizer(SymbolizerWorkerConfig::default()) {
+                Ok((client, handle)) => Ok(kernel_introspection_symbolizer_worker(client, handle)),
+                Err(error) => Err(error),
+            },
         )
-        .introspect(pid)
     }
 
     #[cfg(not(target_os = "linux"))]
     {
         let _ = pid;
         Err(ProcError::UnsupportedPlatform)
+    }
+}
+
+#[doc(hidden)]
+pub trait IntrospectionSymbolizerWorker {
+    fn symbolizer(&self) -> &dyn Symbolizer;
+    fn shutdown(self: Box<Self>) -> Result<(), SymbolizeError>;
+}
+
+struct KernelIntrospectionSymbolizerWorker {
+    client: Arc<dyn Symbolizer>,
+    handle: SymbolizerWorkerHandle,
+}
+
+impl IntrospectionSymbolizerWorker for KernelIntrospectionSymbolizerWorker {
+    fn symbolizer(&self) -> &dyn Symbolizer {
+        self.client.as_ref()
+    }
+
+    fn shutdown(self: Box<Self>) -> Result<(), SymbolizeError> {
+        let Self { client, handle } = *self;
+        let result = handle.shutdown();
+        drop(client);
+        result
+    }
+}
+
+#[doc(hidden)]
+pub fn kernel_introspection_symbolizer_worker(
+    client: SymbolizerWorkerClient,
+    handle: SymbolizerWorkerHandle,
+) -> Box<dyn IntrospectionSymbolizerWorker> {
+    Box::new(KernelIntrospectionSymbolizerWorker {
+        client: Arc::new(client),
+        handle,
+    })
+}
+
+#[doc(hidden)]
+pub fn assemble_default_introspection<F>(
+    pid: i32,
+    source: Arc<dyn ProcSource>,
+    clock: Arc<dyn SampleClock>,
+    sample_interval: Duration,
+    spawn_worker: F,
+) -> Result<Level0, ProcError>
+where
+    F: FnOnce() -> Result<Box<dyn IntrospectionSymbolizerWorker>, SymbolizeError>,
+{
+    validate_requested_pid(pid)?;
+
+    match spawn_worker() {
+        Ok(worker) => {
+            let result = introspect_from_ports(
+                source.as_ref(),
+                worker.symbolizer(),
+                clock.as_ref(),
+                sample_interval,
+                pid,
+            );
+            let shutdown = worker.shutdown();
+
+            match result {
+                Ok(mut level0) => {
+                    if let Err(error) = shutdown {
+                        record_symbolizer_degradation(
+                            &mut level0,
+                            format!(
+                                "symbolizer_shutdown_error_kind={}; worker_shutdown=failed; detail={error}",
+                                error.kind()
+                            ),
+                        );
+                    }
+                    Ok(level0)
+                }
+                Err(error) => {
+                    if let Err(shutdown_error) = shutdown {
+                        tracing::warn!(
+                            error_kind = shutdown_error.kind(),
+                            error = %shutdown_error,
+                            "kernel symbolizer shutdown failed after introspection error"
+                        );
+                    }
+                    Err(error)
+                }
+            }
+        }
+        Err(error) => {
+            let mut level0 = IntrospectService::new(
+                source,
+                Arc::new(FallbackSymbolizer),
+                clock,
+                sample_interval,
+            )
+            .introspect(pid)?;
+            record_symbolizer_degradation(
+                &mut level0,
+                format!(
+                    "symbolizer_init_error_kind={}; fallback=raw_kallsyms; detail={error}",
+                    error.kind()
+                ),
+            );
+            Ok(level0)
+        }
     }
 }
 
@@ -460,11 +570,14 @@ fn build_hotspot(
                 let confidence = symbol.source;
                 (Some(symbol), Some(confidence))
             }
-            Err(_) => {
+            Err(error) => {
                 low_fields.push(LowConfidenceField {
                     path: format!("hotspot.frames[{idx}].symbol"),
                     confidence: Some(SymbolConfidence::Kallsyms),
-                    reason: "symbolizer failed; retained raw kernel Kallsyms symbol".into(),
+                    reason: format!(
+                        "symbolizer failed: error_kind={}; fallback=raw_kallsyms; retained raw kernel Kallsyms symbol; detail={error}",
+                        error.kind()
+                    ),
                 });
                 (
                     Some(Symbolized {
@@ -574,7 +687,20 @@ fn merge_proc_degradations(
     }
 }
 
-fn estimate_level0_tokens(level0: &Level0) -> u32 {
+fn record_symbolizer_degradation(level0: &mut Level0, reason: String) {
+    merge_low_confidence_field(
+        &mut level0.confidence.low_fields,
+        SYMBOLIZER_CONFIDENCE_PATH.into(),
+        SymbolConfidence::None,
+        reason,
+    );
+    level0.confidence.overall =
+        calculate_overall_confidence(&level0.hotspot, &level0.confidence.low_fields);
+    level0.cost_hint.token = estimate_level0_tokens(level0);
+}
+
+#[doc(hidden)]
+pub fn estimate_level0_tokens(level0: &Level0) -> u32 {
     let mut canonical = level0.clone();
     canonical.cost_hint.token = 0;
     let json_bytes = serde_json::to_vec(&canonical).expect("Level0 must serialize");

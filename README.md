@@ -12,14 +12,21 @@ the trusted control plane separate from the guest execution plane.
 
 ## Status
 
+- D1 repository licensing and BPF license enforcement: landed.
 - M0 executable QEMU/KVM host harness: landed.
 - M1 read-only `introspect(pid)` Level 0 with D7 functional acceptance: landed.
+- D5 Linux default blazesym worker wiring and wchan/top-frame cross-check:
+  landed. Raw Kallsyms is retained only as an explicit, confidence-visible
+  fallback.
 - Linux fixtures directly capture `R/S/D/Z/T/t/I`; the kernel-only/transient
   `P/X` parser cases remain explicitly byte-derived and do not claim strict
   direct-capture acceptance.
 - Fixtures also cover lossy procfs text, degraded maps, cgroup variants,
   confidence scoring, token estimates, and measured snapshot spans.
-- CI includes Ubuntu live `/proc` acceptance and macOS portable gates.
+- CI includes Ubuntu live `/proc` and D5 kernel-symbol acceptance, plus macOS
+  portable gates.
+- D6 MCP and `/dev/kmsg`, D3 M6a observation probes, and D4 two-tier
+  snapshots: pending.
 - M0 physical acceptance on a Linux x86_64 KVM host: pending.
 - Kernel-write and eBPF intervention capabilities: not exposed.
 
@@ -149,6 +156,18 @@ cargo test --locked -p guest-agent --test d7_linux_live -- \
 The live scan allows only normal process disappearance and permission
 failures. Parse failures and every other error class fail the gate.
 
+Run the D5 live symbolization gate with nonzero kernel addresses visible:
+
+```bash
+sudo sysctl -w kernel.kptr_restrict=0
+cargo test --locked -p guest-agent --test d5_symbolization -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The D5 gate requires two distinct nonzero `/proc/kallsyms` symbols and checks
+that blazesym returns the corresponding names. Restricted or zeroed addresses
+are a failed prerequisite, not a passing skip.
+
 ## M0 Harness
 
 The M0 tooling is an executable harness. It does not download or create
@@ -188,21 +207,25 @@ reuse a guest disk before collecting required snapshot evidence.
 ## Roadmap
 
 1. Complete M0 physical acceptance on a qualifying Linux x86_64 KVM host.
-2. Replace the mock transport with a real vsock transport and run the guest
+2. Land D6: the host-side MCP front, generated capability documentation, and
+   read-only `/dev/kmsg` projection.
+3. Land D3 M6a: fixed observation-only eBPF counters with registry and
+   owner-scoped flush in the same delivery.
+4. Land D4: overlay cold reset plus native QMP snapshot jobs.
+5. Replace the mock transport with a real vsock transport and run the guest
    path end to end.
-3. Configure the Linux blazesym backend with `vmlinux`/`kallsyms` inputs.
-4. Add the host-side MCP front and self-describing capability catalog.
-5. Land durable audit, arbitration, and pre-execution intervention gates.
-6. Only then consider eBPF intervention, filesystem transactions, and
-   parameterized LKM primitives.
+6. Only after the audit and safety layers exist, consider M7 intervention,
+   filesystem transactions, and parameterized LKM primitives.
 
 ## Current Limitations
 
-- The default M1 compatibility entry point uses `FallbackSymbolizer`; raw
-  kernel stack names are retained as Kallsyms evidence with reduced
-  confidence when richer symbolization fails.
-- `BlazeSymbolizer` is Linux-only, isolated, and not wired into the default
-  compatibility path.
+- Linux `introspect(pid)` starts the blazesym worker by default. Worker
+  initialization, per-address lookup, and shutdown failures fall back or
+  degrade explicitly through `confidence.low_fields`; they are not silent.
+- D5 debuginfod, build-ID caching, stripped-binary recovery, and JIT symbol
+  support remain deferred optimization work.
+- D6 MCP and kernel-log projection, D3 M6a probes, and D4 snapshot changes are
+  not implemented yet.
 - M0 scripts are tooling evidence, not physical KVM acceptance by themselves.
 - Apple Silicon and CI are not equivalent to a real Linux x86_64 KVM host.
 - Write-side semantic contamination remains an open design risk.
@@ -227,4 +250,6 @@ cargo check --locked --all-targets --all-features \
 
 ## License
 
-This repository does not currently include a `LICENSE` file.
+Fovea is licensed under the MIT License. See [`LICENSE`](LICENSE). BPF source
+files use the repository's documented dual MIT/GPL declaration required for
+Linux helper compatibility.
