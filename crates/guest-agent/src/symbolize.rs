@@ -2,8 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::mpsc::{
+    self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError,
+};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -202,6 +204,7 @@ pub struct SymbolizerWorkerClient {
     requests: SyncSender<SymbolizeRequest>,
     request_timeout: Duration,
     lifecycle: Arc<WorkerLifecycle>,
+    _liveness: Arc<()>,
 }
 
 impl SymbolizerWorkerClient {
@@ -273,10 +276,15 @@ pub struct SymbolizerWorkerHandle {
     join: Option<JoinHandle<()>>,
     lifecycle: Arc<WorkerLifecycle>,
     shutdown_timeout: Duration,
+    client_liveness: Weak<()>,
+    shutdown_probe: Option<Sender<usize>>,
 }
 
 impl SymbolizerWorkerHandle {
     pub fn shutdown(mut self) -> Result<(), SymbolizeError> {
+        if let Some(probe) = &self.shutdown_probe {
+            let _ = probe.send(self.client_liveness.strong_count());
+        }
         let shutdown_requested = self.lifecycle.request_shutdown();
         let _ = self.shutdown.send(());
         let join = self.join.take().ok_or(SymbolizeError::WorkerStopped)?;
@@ -336,9 +344,34 @@ pub fn spawn_injected_symbolizer_worker(
     spawn_worker(config, move || Ok(InjectedSymbolizerBackend { symbolizer }))
 }
 
+#[doc(hidden)]
+pub fn spawn_injected_symbolizer_worker_with_shutdown_probe(
+    config: SymbolizerWorkerConfig,
+    symbolizer: Arc<dyn Symbolizer>,
+    shutdown_probe: Sender<usize>,
+) -> Result<(SymbolizerWorkerClient, SymbolizerWorkerHandle), SymbolizeError> {
+    spawn_worker_with_shutdown_probe(
+        config,
+        move || Ok(InjectedSymbolizerBackend { symbolizer }),
+        Some(shutdown_probe),
+    )
+}
+
 fn spawn_worker<B, F>(
     config: SymbolizerWorkerConfig,
     factory: F,
+) -> Result<(SymbolizerWorkerClient, SymbolizerWorkerHandle), SymbolizeError>
+where
+    B: WorkerBackend + 'static,
+    F: FnOnce() -> Result<B, SymbolizeError> + Send + 'static,
+{
+    spawn_worker_with_shutdown_probe(config, factory, None)
+}
+
+fn spawn_worker_with_shutdown_probe<B, F>(
+    config: SymbolizerWorkerConfig,
+    factory: F,
+    shutdown_probe: Option<Sender<usize>>,
 ) -> Result<(SymbolizerWorkerClient, SymbolizerWorkerHandle), SymbolizeError>
 where
     B: WorkerBackend + 'static,
@@ -377,19 +410,26 @@ where
         })?;
 
     match initialized_rx.recv() {
-        Ok(Ok(())) => Ok((
-            SymbolizerWorkerClient {
-                requests,
-                request_timeout: config.request_timeout,
-                lifecycle: Arc::clone(&lifecycle),
-            },
-            SymbolizerWorkerHandle {
-                shutdown,
-                join: Some(join),
-                lifecycle,
-                shutdown_timeout: config.request_timeout,
-            },
-        )),
+        Ok(Ok(())) => {
+            let client_liveness = Arc::new(());
+            let handle_liveness = Arc::downgrade(&client_liveness);
+            Ok((
+                SymbolizerWorkerClient {
+                    requests,
+                    request_timeout: config.request_timeout,
+                    lifecycle: Arc::clone(&lifecycle),
+                    _liveness: client_liveness,
+                },
+                SymbolizerWorkerHandle {
+                    shutdown,
+                    join: Some(join),
+                    lifecycle,
+                    shutdown_timeout: config.request_timeout,
+                    client_liveness: handle_liveness,
+                    shutdown_probe,
+                },
+            ))
+        }
         Ok(Err(error)) => {
             let _ = join.join();
             Err(error)

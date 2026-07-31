@@ -13,7 +13,8 @@ use guest_agent::introspect::{
 use guest_agent::proc_view::{parse_stat, read_kernel_stack_from_str};
 use guest_agent::schema::{Hotspot, LowConfidenceField, SymbolConfidence, Symbolized};
 use guest_agent::symbolize::{
-    spawn_injected_symbolizer_worker, SymbolizeError, Symbolizer, SymbolizerWorkerConfig,
+    spawn_injected_symbolizer_worker, spawn_injected_symbolizer_worker_with_shutdown_probe,
+    SymbolizeError, Symbolizer, SymbolizerWorkerConfig,
 };
 use guest_agent::{
     introspect_with_inputs, CpuCounters, ProcError, ProcSnapshot, ProcSource, SampleClock,
@@ -77,9 +78,9 @@ struct SentinelSymbolizer {
 
 impl Symbolizer for SentinelSymbolizer {
     fn symbolize(&self, addr: u64) -> Result<Symbolized, SymbolizeError> {
-        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(Symbolized {
-            name: format!("{SENTINEL_PREFIX}-{call}-{addr:x}"),
+            name: format!("{SENTINEL_PREFIX}-{addr:016x}"),
             source: SymbolConfidence::Dwarf,
         })
     }
@@ -232,21 +233,43 @@ fn low_fields_at<'a>(fields: &'a [LowConfidenceField], path: &str) -> Vec<&'a Lo
 }
 
 #[test]
-fn successful_default_assembly_returns_sentinel_worker_symbols_without_fallback() {
+fn successful_default_assembly_uses_real_worker_and_retains_client_through_shutdown() {
     let raw_stack = read_kernel_stack_from_str(&fixture_text("level0/stack"));
-    let (level0, calls) = assemble_with_sentinel(None);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let symbolizer: Arc<dyn Symbolizer> = Arc::new(SentinelSymbolizer {
+        calls: Arc::clone(&calls),
+    });
+    let (shutdown_probe, shutdown_observed) = mpsc::channel();
+    let level0 = assemble_fixture(move || {
+        let (client, handle) = spawn_injected_symbolizer_worker_with_shutdown_probe(
+            SymbolizerWorkerConfig {
+                queue_capacity: 1,
+                request_timeout: Duration::from_secs(1),
+            },
+            symbolizer,
+            shutdown_probe,
+        )?;
+        Ok(kernel_introspection_symbolizer_worker(client, handle))
+    });
     let frames = blocked_frames(&level0);
 
+    assert_eq!(
+        shutdown_observed
+            .recv_timeout(Duration::from_secs(1))
+            .expect("real worker shutdown must report client liveness"),
+        1,
+        "exactly the supplied client must still be alive when handle shutdown begins"
+    );
     assert_eq!(frames.len(), raw_stack.len());
     assert_eq!(calls.load(Ordering::SeqCst), frames.len());
-    for (idx, (frame, (_, raw_name))) in frames.iter().zip(raw_stack.iter()).enumerate() {
+    for (idx, (frame, (raw_addr, raw_name))) in frames.iter().zip(raw_stack.iter()).enumerate() {
+        let addr = u64::from_str_radix(raw_addr.trim_start_matches("0x"), 16)
+            .expect("captured stack address must be hexadecimal");
         let symbol = frame
             .symbol
             .as_ref()
             .unwrap_or_else(|| panic!("worker frame {idx} must have a symbol"));
-        assert!(symbol
-            .name
-            .starts_with(&format!("{SENTINEL_PREFIX}-{idx}-")));
+        assert_eq!(symbol.name, format!("{SENTINEL_PREFIX}-{addr:016x}"));
         assert_ne!(&symbol.name, raw_name);
         assert_eq!(symbol.source, SymbolConfidence::Dwarf);
         assert_eq!(frame.confidence, Some(SymbolConfidence::Dwarf));
@@ -257,32 +280,13 @@ fn successful_default_assembly_returns_sentinel_worker_symbols_without_fallback(
         .is_empty());
     }
     assert!(low_fields_at(&level0.confidence.low_fields, "hotspot.frames").is_empty());
+    assert!(level0
+        .confidence
+        .low_fields
+        .iter()
+        .all(|field| !field.reason.contains("symbolizer_shutdown_error_kind=")));
     assert_eq!(level0.confidence.overall, 1.0);
     assert_eq!(level0.cost_hint.token, estimate_level0_tokens(&level0));
-}
-
-#[test]
-fn idle_real_worker_consumed_by_production_wrapper_shuts_down_cleanly() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let symbolizer: Arc<dyn Symbolizer> = Arc::new(SentinelSymbolizer {
-        calls: Arc::clone(&calls),
-    });
-    let (client, handle) = spawn_injected_symbolizer_worker(
-        SymbolizerWorkerConfig {
-            queue_capacity: 1,
-            request_timeout: Duration::from_secs(1),
-        },
-        symbolizer,
-    )
-    .expect("injected worker must start");
-    let worker = kernel_introspection_symbolizer_worker(client, handle);
-
-    assert_eq!(worker.shutdown(), Ok(()));
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "shutdown must not invoke the injected symbolizer"
-    );
 }
 
 #[test]
