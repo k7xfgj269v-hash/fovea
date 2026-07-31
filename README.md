@@ -164,9 +164,10 @@ cargo test --locked -p guest-agent --test d5_symbolization -- \
   --ignored --nocapture --test-threads=1
 ```
 
-The D5 gate requires two distinct nonzero `/proc/kallsyms` symbols and checks
-that blazesym returns the corresponding names. Restricted or zeroed addresses
-are a failed prerequisite, not a passing skip.
+The D5 gate requires two distinct nonzero `/proc/kallsyms` addresses and two
+distinct normalized names. For each address, blazesym must return a name from
+that address's complete Kallsyms alias set. Restricted or zeroed addresses are
+a failed prerequisite, not a passing skip.
 
 ## M0 Harness
 

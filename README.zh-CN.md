@@ -155,8 +155,9 @@ cargo test --locked -p guest-agent --test d5_symbolization -- \
   --ignored --nocapture --test-threads=1
 ```
 
-D5 gate 要求 `/proc/kallsyms` 至少提供两个不同的非零符号，并核对 blazesym
-返回对应名字。地址受限或全零属于前置条件失败，不能按跳过算通过。
+D5 gate 要求 `/proc/kallsyms` 至少提供两个不同的非零地址和两个不同的归一化
+名字。对每个地址，blazesym 返回的名字必须属于该地址完整的 Kallsyms alias
+集合。地址受限或全零属于前置条件失败，不能按跳过算通过。
 
 ## M0 Harness
 
