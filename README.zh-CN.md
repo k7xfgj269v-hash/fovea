@@ -11,13 +11,17 @@ Fovea 是运行在 Linux 之上的特权服务，为 AI operator 提供机器级
 
 ## 当前状态
 
+- D1 仓库许可与 BPF 许可声明门：已落地。
 - M0 可执行 QEMU/KVM 宿主 harness：已落地。
 - M1 只读 `introspect(pid)` Level 0 与 D7 功能验收：已落地。
+- D5 Linux 默认 blazesym worker 接线与 wchan/栈顶双路校验：已落地。
+  原始 Kallsyms 只作为显式、会写入置信度证据的降级路径保留。
 - Linux fixture 已直接捕获 `R/S/D/Z/T/t/I`；仅内核可稳定制造或极短暂的
   `P/X` 仍明确标记为单字节派生，不冒充严格真机捕获。
 - fixture 还覆盖 procfs 非 UTF-8、maps 降级、cgroup 变体、置信度、
   token 估算与实际快照跨度。
-- CI 已包含 Ubuntu live `/proc` 验收与 macOS 可移植门。
+- CI 已包含 Ubuntu live `/proc`、D5 内核符号验收与 macOS 可移植门。
+- D6 MCP 与 `/dev/kmsg`、D3 M6a 只读观测探针、D4 两档快照：待完成。
 - Linux x86_64 KVM 主机上的 M0 物理验收：待完成。
 - 内核写能力与 eBPF 干预能力：尚未暴露。
 
@@ -143,6 +147,17 @@ cargo test --locked -p guest-agent --test d7_linux_live -- \
 全 PID 扫描只允许进程正常退出和权限不足；任何 parse failure 或其他错误类别
 都会使验收失败。
 
+在内核地址可见的 Linux 环境运行 D5 真机符号化门：
+
+```bash
+sudo sysctl -w kernel.kptr_restrict=0
+cargo test --locked -p guest-agent --test d5_symbolization -- \
+  --ignored --nocapture --test-threads=1
+```
+
+D5 gate 要求 `/proc/kallsyms` 至少提供两个不同的非零符号，并核对 blazesym
+返回对应名字。地址受限或全零属于前置条件失败，不能按跳过算通过。
+
 ## M0 Harness
 
 M0 工具是可执行 harness，不会下载或创建 kernel、initrd、disk 或 symbol artifact。
@@ -179,17 +194,20 @@ QMP 与 GDB 都是未认证的控制接口。保持 socket 和端口只绑定 lo
 ## 路线图
 
 1. 在合格的 Linux x86_64 KVM 主机上完成 M0 物理验收。
-2. 用真实 vsock transport 替换 mock transport，打通 guest 端到端路径。
-3. 为 Linux blazesym 后端配置 `vmlinux`/`kallsyms` 输入。
-4. 增加 host-side MCP front 与自描述能力目录。
-5. 落地持久化审计、仲裁和执行前干预门。
-6. 之后再考虑 eBPF 干预、文件系统事务和参数化 LKM 原语。
+2. 落地 D6：host-side MCP front、生成式能力文档与只读 `/dev/kmsg` 投影。
+3. 落地 D3 M6a：固定模板的只读 eBPF 计数器，并同批交付 registry 与按
+   owner flush。
+4. 落地 D4：overlay 冷重置与原生 QMP snapshot job。
+5. 用真实 vsock transport 替换 mock transport，打通 guest 端到端路径。
+6. 审计与安全层就位后，再考虑 M7 干预、文件系统事务和参数化 LKM 原语。
 
 ## 当前限制
 
-- 默认 M1 兼容入口使用 `FallbackSymbolizer`；更高档符号化失败时仍保留
-  Kallsyms 原始内核栈名字，并明确降低置信度。
-- `BlazeSymbolizer` 仅 Linux 可用，已隔离但尚未接入默认兼容路径。
+- Linux `introspect(pid)` 默认启动 blazesym worker。worker 初始化、单地址
+  查询和关闭失败都会显式降级或写入 `confidence.low_fields`，不会静默吞掉。
+- D5 的 debuginfod、build-ID 缓存、stripped binary 恢复与 JIT 符号仍属于
+  后续优化。
+- D6 MCP/内核日志投影、D3 M6a 探针和 D4 快照改造尚未实现。
 - M0 脚本只是工具链证据，不等于物理 KVM 验收。
 - Apple Silicon 和 CI 不等价于真实 Linux x86_64 KVM 主机。
 - 写侧语义污染仍是开放设计风险。
@@ -213,4 +231,5 @@ cargo check --locked --all-targets --all-features \
 
 ## License
 
-仓库当前未包含 `LICENSE` 文件。
+Fovea 使用 MIT License，见 [`LICENSE`](LICENSE)。BPF 源文件按仓库约定使用
+Linux helper 兼容所需的 MIT/GPL 双许可声明。
