@@ -5,7 +5,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -31,6 +31,8 @@ pub enum SymbolizeError {
     WorkerStopped,
     #[error("符号化 worker panic")]
     WorkerPanic,
+    #[error("符号化 worker 关闭超时")]
+    ShutdownTimeout,
 }
 
 impl SymbolizeError {
@@ -43,6 +45,7 @@ impl SymbolizeError {
             SymbolizeError::Timeout => "timeout",
             SymbolizeError::WorkerStopped => "worker_stopped",
             SymbolizeError::WorkerPanic => "worker_panic",
+            SymbolizeError::ShutdownTimeout => "shutdown_timeout",
         }
     }
 }
@@ -269,6 +272,7 @@ pub struct SymbolizerWorkerHandle {
     shutdown: mpsc::Sender<()>,
     join: Option<JoinHandle<()>>,
     lifecycle: Arc<WorkerLifecycle>,
+    shutdown_timeout: Duration,
 }
 
 impl SymbolizerWorkerHandle {
@@ -276,6 +280,14 @@ impl SymbolizerWorkerHandle {
         let shutdown_requested = self.lifecycle.request_shutdown();
         let _ = self.shutdown.send(());
         let join = self.join.take().ok_or(SymbolizeError::WorkerStopped)?;
+        let started = Instant::now();
+        while !join.is_finished() {
+            let elapsed = started.elapsed();
+            if elapsed >= self.shutdown_timeout {
+                return Err(SymbolizeError::ShutdownTimeout);
+            }
+            thread::sleep(WORKER_POLL_INTERVAL.min(self.shutdown_timeout - elapsed));
+        }
         match join.join() {
             Ok(()) if shutdown_requested => Ok(()),
             Ok(()) => Err(SymbolizeError::WorkerStopped),
@@ -304,6 +316,24 @@ pub fn spawn_kernel_symbolizer(
     {
         spawn_worker::<UnavailableKernelBackend, _>(config, || Err(SymbolizeError::NoSymbolFile))
     }
+}
+
+struct InjectedSymbolizerBackend {
+    symbolizer: Arc<dyn Symbolizer>,
+}
+
+impl WorkerBackend for InjectedSymbolizerBackend {
+    fn symbolize(&mut self, addr: u64) -> Result<Symbolized, SymbolizeError> {
+        self.symbolizer.symbolize(addr)
+    }
+}
+
+#[doc(hidden)]
+pub fn spawn_injected_symbolizer_worker(
+    config: SymbolizerWorkerConfig,
+    symbolizer: Arc<dyn Symbolizer>,
+) -> Result<(SymbolizerWorkerClient, SymbolizerWorkerHandle), SymbolizeError> {
+    spawn_worker(config, move || Ok(InjectedSymbolizerBackend { symbolizer }))
 }
 
 fn spawn_worker<B, F>(
@@ -357,6 +387,7 @@ where
                 shutdown,
                 join: Some(join),
                 lifecycle,
+                shutdown_timeout: config.request_timeout,
             },
         )),
         Ok(Err(error)) => {
